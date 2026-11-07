@@ -61,5 +61,5 @@ The core client script manages the entire lifecycle of the P2P connection and fi
 
 ## 🌐 Links & Resources
 
-* **Live Application:** [P2P / Terminal on Vercel](https://file-sharing-terminal.vercel.app/#docs)
+* **Live Application:** [P2P / Terminal on Vercel](https://p2pfilesharing-mu.vercel.app/)
 * **Documentation & Help:** Built-in interactive guide available at the `#docs` endpoint.
