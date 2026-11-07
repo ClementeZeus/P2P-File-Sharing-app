@@ -59,27 +59,32 @@
   // STUN alone only works when both peers are behind "easy" NATs. Mobile
   // carrier networks almost always use symmetric/carrier-grade NAT, which
   // STUN can't punch through — that's why phone <-> laptop was failing
-  // while WiFi <-> WiFi would've worked. The turn: entries below are
-  // Open Relay Project's free public TURN relay (openrelayproject.org),
-  // meant for exactly this kind of use — no account needed. Swap them for
-  // your own TURN credentials later if you outgrow the free tier.
+  // while WiFi <-> WiFi would've worked. The turn: entries below are this
+  // project's own Metered.ca TURN credentials (free tier, 50 GB/mo) — swap
+  // them in the Metered dashboard if you ever need to rotate them.
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.relay.metered.ca:80' },
     {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
+      urls: 'turn:global.relay.metered.ca:80',
+      username: 'aeff1e0da101d247f5421f41',
+      credential: 'keZyB3lkVjWPUr4i',
     },
     {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
+      urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+      username: 'aeff1e0da101d247f5421f41',
+      credential: 'keZyB3lkVjWPUr4i',
     },
     {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
+      urls: 'turn:global.relay.metered.ca:443',
+      username: 'aeff1e0da101d247f5421f41',
+      credential: 'keZyB3lkVjWPUr4i',
+    },
+    {
+      urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+      username: 'aeff1e0da101d247f5421f41',
+      credential: 'keZyB3lkVjWPUr4i',
     },
   ];
 
