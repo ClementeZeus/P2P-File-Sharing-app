@@ -47,7 +47,7 @@
   // Render terminates TLS on 443 and proxies internally to your app's PORT,
   // so no :port suffix goes here — just the bare host, scheme wss://.
   // (Only use the localhost fallback below while testing on one machine.)
-  const SIGNALING_URL = 'wss://p2p-file-sharing-app.onrender.com';
+  const SIGNALING_URL = 'wss://p2p-web-file-sharing-terminal.onrender.com/';
   // const SIGNALING_URL = 'ws://localhost:8080'; // local testing fallback
 
   // p2p.ai runs as a Vercel Serverless Function alongside this static site
@@ -56,9 +56,31 @@
   const AI_ENDPOINT = '/api/chat';
   const AI_HISTORY_LIMIT = 8; // messages (not pairs) kept as context for the assistant
 
+  // STUN alone only works when both peers are behind "easy" NATs. Mobile
+  // carrier networks almost always use symmetric/carrier-grade NAT, which
+  // STUN can't punch through — that's why phone <-> laptop was failing
+  // while WiFi <-> WiFi would've worked. The turn: entries below are
+  // Open Relay Project's free public TURN relay (openrelayproject.org),
+  // meant for exactly this kind of use — no account needed. Swap them for
+  // your own TURN credentials later if you outgrow the free tier.
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ];
 
   const CHUNK_SIZE = 64 * 1024;                 // 64 KB per data channel message
