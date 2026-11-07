@@ -59,34 +59,42 @@
   // STUN alone only works when both peers are behind "easy" NATs. Mobile
   // carrier networks almost always use symmetric/carrier-grade NAT, which
   // STUN can't punch through — that's why phone <-> laptop was failing
-  // while WiFi <-> WiFi would've worked. The turn: entries below are this
-  // project's own Metered.ca TURN credentials (free tier, 50 GB/mo) — swap
-  // them in the Metered dashboard if you ever need to rotate them.
+  // while WiFi <-> WiFi would've worked. STUN entries carry no secret, so
+  // they're fine to keep here. The TURN credentials are NOT hardcoded —
+  // they're fetched from /api/turn (api/turn.js), which reads them out of
+  // a Vercel environment variable server-side, same pattern as GROQ_API_KEY
+  // in api/chat.js. That keeps them out of this public source file; a
+  // browser using the live app still has to receive them to use TURN at
+  // all (that's unavoidable for any client-side WebRTC app), but they're
+  // no longer sitting in the GitHub repo for anyone browsing the code.
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun.relay.metered.ca:80' },
-    {
-      urls: 'turn:global.relay.metered.ca:80',
-      username: 'aeff1e0da101d247f5421f41',
-      credential: 'keZyB3lkVjWPUr4i',
-    },
-    {
-      urls: 'turn:global.relay.metered.ca:80?transport=tcp',
-      username: 'aeff1e0da101d247f5421f41',
-      credential: 'keZyB3lkVjWPUr4i',
-    },
-    {
-      urls: 'turn:global.relay.metered.ca:443',
-      username: 'aeff1e0da101d247f5421f41',
-      credential: 'keZyB3lkVjWPUr4i',
-    },
-    {
-      urls: 'turns:global.relay.metered.ca:443?transport=tcp',
-      username: 'aeff1e0da101d247f5421f41',
-      credential: 'keZyB3lkVjWPUr4i',
-    },
   ];
+
+  const TURN_ENDPOINT = '/api/turn';
+
+  // Called once from BOOT, below. Runs well before the user can click
+  // Create/Join in practice — initPeerConnection() only ever fires after
+  // a room exists, which needs a human click first — but initPeerConnection
+  // doesn't explicitly await this, so if your deployment's /api/turn is
+  // unusually slow, keep that ordering in mind.
+  async function loadTurnServers() {
+    try {
+      const res = await fetch(TURN_ENDPOINT);
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data = await res.json();
+      if (Array.isArray(data.iceServers) && data.iceServers.length) {
+        ICE_SERVERS.push(...data.iceServers);
+        logLine('turn relay credentials loaded', 'ok');
+      } else {
+        logLine('turn relay not configured on this deployment — STUN only', 'warn');
+      }
+    } catch (err) {
+      logLine(`turn relay unavailable — falling back to STUN only (${err.message})`, 'warn');
+    }
+  }
 
   const CHUNK_SIZE = 64 * 1024;                 // 64 KB per data channel message
   // Chromium's RTCDataChannel has an internal hard cap on queued-but-unsent
@@ -1327,5 +1335,6 @@
 
   setBootStatus('Initializing interface…');
   logLine('p2p::terminal ready', 'ok');
+  loadTurnServers();
   connectSignaling();
 })();
