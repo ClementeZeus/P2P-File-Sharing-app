@@ -207,6 +207,18 @@ wss.on('connection', (socket, req) => {
         break;
       }
 
+      case 'relay': {
+        // Opaque relay for file-transfer control chatter (meta/end/
+        // verify-result) riding the WS fallback transport alongside the
+        // binary chunks — same "don't look inside" treatment as 'signal'.
+        const room = rooms.get(socket.roomId);
+        if (!room) {
+          return send(socket, { type: 'error', message: 'You are not in a room yet.' });
+        }
+        broadcastToRoom(room, socket, { type: 'relay', data: msg.data });
+        break;
+      }
+
       default:
         send(socket, { type: 'error', message: `Unknown message type: ${msg.type}` });
     }
@@ -244,3 +256,4 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeat));
 
 log('SERVER_UP', { port: PORT, url: `ws://localhost:${PORT}` });
+                             
