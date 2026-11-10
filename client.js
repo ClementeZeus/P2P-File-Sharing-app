@@ -60,26 +60,20 @@
   // carrier networks almost always use symmetric/carrier-grade NAT, which
   // STUN can't punch through — that's why phone <-> laptop was failing
   // while WiFi <-> WiFi (or phone <-> itself in a second tab) would've
-  // worked. STUN entries carry no secret, so they're fine to keep here.
+  // worked. STUN entries carry no secret, so they're fine to keep here —
+  // this is the only ICE config the app has; there's no TURN, no
+  // credentialed relay, no third-party account of any kind.
   //
-  // No TURN API key is required anymore. /api/turn + METERED_TURN_* is
-  // still supported below (loadTurnServers keeps trying it, and uses it
-  // when it's there — a real TURN relay is still lower-latency and
-  // doesn't cost this app's own signaling server any bandwidth), but it's
-  // now fully optional: if it's unconfigured, or the direct WebRTC link
-  // just doesn't come up in time, client.js falls back to WS_RELAY —
-  // shipping file data over the exact same WebSocket connection that's
-  // already open to SIGNALING_URL, with server.js forwarding the raw
-  // bytes to the other peer. That path needs no credentials of any kind,
-  // only your own server. See RELAY_FALLBACK_MS and the transport layer
-  // in SECTION 2b below.
+  // When a direct WebRTC link doesn't come up within RELAY_FALLBACK_MS,
+  // or drops mid-transfer, client.js falls back to shipping file data
+  // over the exact same WebSocket connection already open to
+  // SIGNALING_URL, with server.js forwarding the raw bytes to the other
+  // peer. That path needs no API key, only your own server. See the
+  // transport layer in SECTION 2b below.
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.relay.metered.ca:80' },
   ];
-
-  const TURN_ENDPOINT = '/api/turn';
 
   // How long to let the direct WebRTC handshake try before giving up on
   // it for this transfer and using the WS relay instead. Generous enough
@@ -89,27 +83,6 @@
   // using it anyway (see transportMode()) — the timer only controls how
   // long we wait before treating relay as good enough to proceed with.
   const RELAY_FALLBACK_MS = 6000;
-
-  // Called once from BOOT, below. Runs well before the user can click
-  // Create/Join in practice — initPeerConnection() only ever fires after
-  // a room exists, which needs a human click first — but initPeerConnection
-  // doesn't explicitly await this, so if your deployment's /api/turn is
-  // unusually slow, keep that ordering in mind.
-  async function loadTurnServers() {
-    try {
-      const res = await fetch(TURN_ENDPOINT);
-      if (!res.ok) throw new Error(`status ${res.status}`);
-      const data = await res.json();
-      if (Array.isArray(data.iceServers) && data.iceServers.length) {
-        ICE_SERVERS.push(...data.iceServers);
-        logLine('turn relay credentials loaded', 'ok');
-      } else {
-        logLine('turn not configured on this deployment — STUN only, WS relay is the fallback', 'warn');
-      }
-    } catch (err) {
-      logLine(`turn endpoint unavailable — STUN only, WS relay is the fallback (${err.message})`, 'warn');
-    }
-  }
 
   const CHUNK_SIZE = 64 * 1024;                 // 64 KB per data channel message
   // Chromium's RTCDataChannel has an internal hard cap on queued-but-unsent
@@ -477,7 +450,7 @@
   function handleSignalingMessage(msg) {
     switch (msg.type) {
       case 'created':
-      roomId = msg.roomId;
+        roomId = msg.roomId;
         isHost = true;
         el.roomCodeValue.textContent = roomId;
         el.roomCodeBox.classList.remove('hidden');
@@ -518,7 +491,7 @@
         handleRemoteSignal(msg.data);
         break;
 
-      case 'error':
+    case 'error':
         logLine(`server: ${msg.message}`, 'err');
         break;
 
@@ -1022,7 +995,7 @@
     if (el.mobileMenu.hidden) openMobileMenu(); else closeMobileMenu();
   });
 
- el.mobileMenu.addEventListener('click', (e) => {
+  el.mobileMenu.addEventListener('click', (e) => {
     const item = e.target.closest('.mobile-menu-item');
     if (item) activateTab(item.dataset.tab);
   });
@@ -1042,7 +1015,7 @@
     if (e.key === 'Escape' && !el.mobileMenu.hidden) closeMobileMenu();
   });
 
-  // Docs is the default landing tab; #app / #transfer and #ai deep-link directly.
+ // Docs is the default landing tab; #app / #transfer and #ai deep-link directly.
   activateTab(
     location.hash === '#app' || location.hash === '#transfer' ? 'app'
       : location.hash === '#ai' ? 'ai'
@@ -1491,6 +1464,5 @@
 
   setBootStatus('Initializing interface…');
   logLine('p2p::terminal ready', 'ok');
-  loadTurnServers();
   connectSignaling();
 })();
