@@ -59,14 +59,20 @@
   // STUN alone only works when both peers are behind "easy" NATs. Mobile
   // carrier networks almost always use symmetric/carrier-grade NAT, which
   // STUN can't punch through — that's why phone <-> laptop was failing
-  // while WiFi <-> WiFi would've worked. STUN entries carry no secret, so
-  // they're fine to keep here. The TURN credentials are NOT hardcoded —
-  // they're fetched from /api/turn (api/turn.js), which reads them out of
-  // a Vercel environment variable server-side, same pattern as GROQ_API_KEY
-  // in api/chat.js. That keeps them out of this public source file; a
-  // browser using the live app still has to receive them to use TURN at
-  // all (that's unavoidable for any client-side WebRTC app), but they're
-  // no longer sitting in the GitHub repo for anyone browsing the code.
+  // while WiFi <-> WiFi (or phone <-> itself in a second tab) would've
+  // worked. STUN entries carry no secret, so they're fine to keep here.
+  //
+  // No TURN API key is required anymore. /api/turn + METERED_TURN_* is
+  // still supported below (loadTurnServers keeps trying it, and uses it
+  // when it's there — a real TURN relay is still lower-latency and
+  // doesn't cost this app's own signaling server any bandwidth), but it's
+  // now fully optional: if it's unconfigured, or the direct WebRTC link
+  // just doesn't come up in time, client.js falls back to WS_RELAY —
+  // shipping file data over the exact same WebSocket connection that's
+  // already open to SIGNALING_URL, with server.js forwarding the raw
+  // bytes to the other peer. That path needs no credentials of any kind,
+  // only your own server. See RELAY_FALLBACK_MS and the transport layer
+  // in SECTION 2b below.
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -74,6 +80,15 @@
   ];
 
   const TURN_ENDPOINT = '/api/turn';
+
+  // How long to let the direct WebRTC handshake try before giving up on
+  // it for this transfer and using the WS relay instead. Generous enough
+  // that a slow-but-working STUN negotiation isn't cut off early; short
+  // enough that a dead negotiation doesn't leave the user staring at a
+  // spinner. If WebRTC *does* come up after this fires, client.js keeps
+  // using it anyway (see transportMode()) — the timer only controls how
+  // long we wait before treating relay as good enough to proceed with.
+  const RELAY_FALLBACK_MS = 6000;
 
   // Called once from BOOT, below. Runs well before the user can click
   // Create/Join in practice — initPeerConnection() only ever fires after
@@ -89,10 +104,10 @@
         ICE_SERVERS.push(...data.iceServers);
         logLine('turn relay credentials loaded', 'ok');
       } else {
-        logLine('turn relay not configured on this deployment — STUN only', 'warn');
+        logLine('turn not configured on this deployment — STUN only, WS relay is the fallback', 'warn');
       }
     } catch (err) {
-      logLine(`turn relay unavailable — falling back to STUN only (${err.message})`, 'warn');
+      logLine(`turn endpoint unavailable — STUN only, WS relay is the fallback (${err.message})`, 'warn');
     }
   }
 
@@ -194,6 +209,19 @@
   let wsReconnectAttempts = 0;
   let wsReconnectTimer = null;
 
+  // True once the other socket is confirmed in the same room — the WS
+  // relay transport needs nothing more than this to be usable, since the
+  // room pairing already exists on server.js the moment both are joined.
+  let peerPresent = false;
+  let relayFallbackTimer = null;
+  let relayAnnounced = false; // so the "using relay" log line only fires once per session
+
+  // JSON message types that are file-transfer control chatter riding the
+  // WS relay channel (as opposed to server.js's own signaling protocol:
+  // created/joined/peer-joined/peer-left/signal/error). Kept as a Set so
+  // routing ws.onmessage is a single lookup, not a chain of ifs.
+  const FILE_CONTROL_TYPES = new Set(['meta', 'end', 'verify-result']);
+
   /** Receiver-side accumulation state for the file currently inbound. */
   let inbound = null; // { name, size, mime, chunks: [], received, startTime }
 
@@ -258,15 +286,17 @@
     el.btnJoin.disabled = !ready;
   }
 
-  function setPeerStatus(state) {
+  function setPeerStatus(state, detail) {
     // state: 'none' | 'waiting' | 'connected' | 'lost'
+    // detail: optional short suffix, e.g. 'relay' when the link is up via
+    // the WS fallback transport rather than a direct WebRTC data channel.
     el.dotPeer.className = 'status-dot ' + (state === 'connected' ? 'on' : state === 'waiting' ? 'warn' : state === 'lost' ? 'err' : 'off');
-    el.txtPeer.textContent = { none: 'none', waiting: 'waiting', connected: 'linked', lost: 'lost' }[state];
+    el.txtPeer.textContent = { none: 'none', waiting: 'waiting', connected: 'linked', lost: 'lost' }[state] + (detail ? ` (${detail})` : '');
 
     // Drive the hero readout — the single most load-bearing fact on screen.
-    el.heroStatus.textContent = {
+    el.heroStatus.textContent = ({
       none: 'No active session', waiting: 'Awaiting peer', connected: 'Connected', lost: 'Link lost',
-    }[state];
+    }[state]) + (detail ? ` (${detail})` : '');
     el.heroStatus.className = 'hero-value ' + (
       state === 'connected' ? 'state-on' : state === 'waiting' ? 'state-wait' : state === 'lost' ? 'state-err' : ''
     );
@@ -372,6 +402,7 @@
     setWsStatus('connecting');
     setBootStatus('Connecting to signaling server…');
     ws = new WebSocket(SIGNALING_URL);
+    ws.binaryType = 'arraybuffer'; // relay-mode chunks arrive as ArrayBuffer, matching the data channel
 
     ws.onopen = () => {
       wsReconnectAttempts = 0;
@@ -382,11 +413,26 @@
     };
 
     ws.onmessage = (event) => {
+      // Relay-mode file chunk: binary frame forwarded opaquely by
+      // server.js. Feed it through the exact same path a WebRTC data
+      // channel message would take, so TRANSFER-section code never needs
+      // to know which transport actually carried the bytes.
+      if (typeof event.data !== 'string') {
+        return handleIncomingMessage(event);
+      }
+
       let msg;
       try {
         msg = JSON.parse(event.data);
       } catch {
         return logLine('received malformed signaling message', 'err');
+      }
+
+      // File-control chatter (meta/end/verify-result) riding the relay
+      // channel also goes to handleIncomingMessage; everything else is
+      // server.js's own signaling protocol.
+      if (FILE_CONTROL_TYPES.has(msg.type)) {
+        return handleIncomingMessage({ data: event.data });
       }
       handleSignalingMessage(msg);
     };
@@ -402,6 +448,9 @@
       teardownPeerConnection();
       roomId = null;
       isHost = false;
+      peerPresent = false;
+      relayAnnounced = false;
+      clearTimeout(relayFallbackTimer);
       el.roomCodeBox.classList.add('hidden');
       setBootStatus('Signaling unavailable — retrying…');
       finishBoot();
@@ -428,7 +477,7 @@
   function handleSignalingMessage(msg) {
     switch (msg.type) {
       case 'created':
-        roomId = msg.roomId;
+      roomId = msg.roomId;
         isHost = true;
         el.roomCodeValue.textContent = roomId;
         el.roomCodeBox.classList.remove('hidden');
@@ -440,20 +489,27 @@
       case 'joined':
         roomId = msg.roomId;
         isHost = false;
+        peerPresent = true;
         setPeerStatus('waiting');
         logLine(`joined room ${roomId} — negotiating link...`, 'ok');
         // Guest waits passively; host initiates the offer once it sees peer-joined.
         initPeerConnection(false);
+        armRelayFallback();
         break;
 
       case 'peer-joined':
         // Fires on the HOST once the guest joins. Host drives the offer.
+        peerPresent = true;
         logLine('peer joined — opening data channel...', 'ok');
         initPeerConnection(true);
+        armRelayFallback();
         break;
 
       case 'peer-left':
         logLine('peer disconnected', 'warn');
+        peerPresent = false;
+        relayAnnounced = false;
+        clearTimeout(relayFallbackTimer);
         setPeerStatus('lost');
         teardownPeerConnection();
         break;
@@ -490,11 +546,10 @@
       if (!pc) return;
       logLine(`ice state: ${pc.iceConnectionState}`, 'info');
       if (pc.iceConnectionState === 'failed') {
-        logLine('ice handshake failed — peer may be behind a restrictive NAT', 'err');
-        setPeerStatus('lost');
+        reportLinkDown('ice handshake failed — peer may be behind a restrictive NAT');
       }
       if (pc.iceConnectionState === 'disconnected') {
-        setPeerStatus('lost');
+        reportLinkDown();
       }
     };
 
@@ -503,6 +558,7 @@
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         logLine(`connection ${pc.connectionState}`, 'err');
         teardownPeerConnection();
+        reportLinkDown();
       }
     };
 
@@ -556,14 +612,17 @@
     channel.bufferedAmountLowThreshold = BUFFER_LOW_WATER;
 
     channel.onopen = () => {
+      clearTimeout(relayFallbackTimer);
+      const wasRelay = relayAnnounced;
+      relayAnnounced = false;
       setPeerStatus('connected');
-      logLine('data channel open — link established', 'ok');
+      logLine(wasRelay ? 'direct data channel came up — switching off the relay' : 'data channel open — link established', 'ok');
     };
 
     channel.onclose = () => {
-      setPeerStatus('lost');
       setLinkActivity(false);
       logLine('data channel closed', 'warn');
+      reportLinkDown();
     };
 
     channel.onerror = (event) => {
@@ -591,12 +650,120 @@
     }
   }
 
+  /**
+   * Starts (restarting any previous one) the countdown to declaring the
+   * WS relay good enough, called every time a peer shows up in the room.
+   * Does nothing itself beyond flipping the UI/log state — transportSend
+   * and transportReady() below don't actually consult this timer; they
+   * just check "is the data channel open right now", and fall back to
+   * relay on their own whenever it isn't. The timer's only job is making
+   * sure the user isn't left watching "Awaiting peer" forever if WebRTC
+   * never comes up at all.
+   */
+  /**
+   * Called whenever the WebRTC side of the link goes down (ICE failed/
+   * disconnected, peer connection failed/closed, or the data channel
+   * itself closed). Mid-transfer, this is the difference between "the
+   * transfer dies" and "the next chunk just goes out over the relay
+   * instead" — transportSend() already falls back on its own per-call,
+   * this just keeps the status badge honest about which is true.
+   */
+  function reportLinkDown(reasonLog) {
+    if (reasonLog) logLine(reasonLog, 'err');
+    if (peerPresent && ws && ws.readyState === WebSocket.OPEN) {
+      relayAnnounced = true;
+      setPeerStatus('connected', 'relay');
+      logLine('direct link down — continuing over the server relay', 'warn');
+    } else {
+      setPeerStatus('lost');
+    }
+  }
+
+  function armRelayFallback() {
+    clearTimeout(relayFallbackTimer);
+    relayFallbackTimer = setTimeout(() => {
+      if (dataChannel && dataChannel.readyState === 'open') return; // WebRTC made it — nothing to announce
+      if (!peerPresent) return; // peer already left before this fired
+      relayAnnounced = true;
+      setPeerStatus('connected', 'relay');
+      logLine(`direct link didn't come up within ${RELAY_FALLBACK_MS / 1000}s — shipping over the server relay instead`, 'warn');
+    }, RELAY_FALLBACK_MS);
+  }
+
+  // =========================================================================
+  // SECTION 2b — TRANSPORT (picks WebRTC data channel vs. WS relay per send,
+  // so TRANSFER code below never has to know which one actually moved the
+  // bytes. Preference order: an open data channel first — it's direct,
+  // lower-latency, and free of this server's bandwidth — then the relay.)
+  // =========================================================================
+
+  function transportMode() {
+    if (dataChannel && dataChannel.readyState === 'open') return 'webrtc';
+    if (peerPresent && ws && ws.readyState === WebSocket.OPEN) return 'relay';
+    return null;
+  }
+
+  function transportReady() {
+    return transportMode() !== null;
+  }
+
+  /** Raw bytes or a JSON string — same contract as dataChannel.send(). */
+  function transportSend(data) {
+    const mode = transportMode();
+    if (mode === 'webrtc') {
+      dataChannel.send(data);
+    } else if (mode === 'relay') {
+      if (!relayAnnounced) {
+        relayAnnounced = true;
+        clearTimeout(relayFallbackTimer);
+        setPeerStatus('connected', 'relay');
+        logLine('shipping over the server relay (no direct link yet)', 'warn');
+      }
+      ws.send(data);
+    } else {
+      throw new Error('no active peer link');
+    }
+  }
+
+  function transportBufferedAmount() {
+    const mode = transportMode();
+    if (mode === 'webrtc') return dataChannel.bufferedAmount;
+    if (mode === 'relay') return ws.bufferedAmount;
+    return 0;
+  }
+
+  /**
+   * Calls `cb` once bufferedAmount has drained below BUFFER_LOW_WATER.
+   * RTCDataChannel fires a real 'bufferedamountlow' event for this; plain
+   * WebSocket has no equivalent in browser JS (its bufferedAmount getter
+   * exists, but nothing tells you when it drops), so the relay path just
+   * polls — same 50ms cadence sendChunks already used as its own
+   * no-event-ever-fires fallback, now the only path relay takes.
+   */
+  function waitForDrain(cb) {
+    const mode = transportMode();
+    if (mode === 'webrtc') {
+      if (dataChannel.bufferedAmount <= BUFFER_LOW_WATER) {
+        setTimeout(cb, 50);
+        return;
+      }
+      dataChannel.onbufferedamountlow = () => {
+        dataChannel.onbufferedamountlow = null;
+        cb();
+      };
+      return;
+    }
+    // relay (or mode dropped out entirely, e.g. peer left mid-transfer —
+    // let the retry hit transportSend's "no active peer link" throw)
+    setTimeout(cb, 50);
+  }
+
   // =========================================================================
   // SECTION 3 — TRANSFER (chunking, backpressure, hashing, download)
   // =========================================================================
 
   async function sendFile(file) {
-    if (!dataChannel || dataChannel.readyState !== 'open') {
+    if (!transportReady()) {
       logLine('no active peer link — create or join a room first', 'err');
       return;
     }
@@ -613,7 +780,7 @@
     }
 
     // Announce the incoming file so the receiver can prep its buffer.
-   dataChannel.send(JSON.stringify({
+    transportSend(JSON.stringify({
       type: 'meta',
       name: file.name,
       size: file.size,
@@ -637,7 +804,7 @@
       return;
     }
 
-    dataChannel.send(JSON.stringify({ type: 'end', hash: hashHex }));
+    transportSend(JSON.stringify({ type: 'end', hash: hashHex }));
     updateTransferMetrics(file.size, file.size, startTime, true);
     setLinkActivity(false);
     logLine(`transfer complete — ${file.name} sent`, 'ok');
@@ -661,34 +828,23 @@
       let chunksSinceYield = 0;
 
       function pauseForDrain() {
-        // If bufferedAmount is already at/below the low-water mark, the
-        // 'bufferedamountlow' event will never fire (it only fires on a
-        // transition down across the threshold) — most often this happens
-        // when a send() throws "queue is full" before anything was
-        // actually queued, so bufferedAmount never rose in the first
-        // place. Retrying on a short timer covers that case instead of
-        // waiting forever on an event that won't come.
-        if (dataChannel.bufferedAmount <= BUFFER_LOW_WATER) {
-          setTimeout(pump, 50);
-          return;
-        }
-        dataChannel.onbufferedamountlow = () => {
-          dataChannel.onbufferedamountlow = null;
-          pump();
-        };
+        // waitForDrain already covers the "bufferedAmount is already low
+        // but the event will never fire" case for WebRTC, and always
+        // polls for relay — see its doc comment in SECTION 2b.
+        waitForDrain(pump);
       }
 
       function pump() {
         try {
           while (offset < total) {
-            if (dataChannel.bufferedAmount > BUFFER_HIGH_WATER) {
+            if (transportBufferedAmount() > BUFFER_HIGH_WATER) {
               pauseForDrain();
               return;
             }
 
             const end = Math.min(offset + CHUNK_SIZE, total);
             try {
-              dataChannel.send(buffer.slice(offset, end));
+              transportSend(buffer.slice(offset, end));
             } catch (sendErr) {
               // The browser's own internal send queue (independent of our
               // BUFFER_HIGH_WATER check, and not always reflected by
@@ -795,8 +951,8 @@
     // Let the sender know too — it has no visibility into what we
     // actually received or computed otherwise, and its own checksum/remote
     // hash fields would sit on "pending" forever without this.
-    if (dataChannel && dataChannel.readyState === 'open') {
-      dataChannel.send(JSON.stringify({ type: 'verify-result', hash: localHash, match }));
+    if (transportReady()) {
+      transportSend(JSON.stringify({ type: 'verify-result', hash: localHash, match }));
     }
 
     setLinkActivity(false);
@@ -866,7 +1022,7 @@
     if (el.mobileMenu.hidden) openMobileMenu(); else closeMobileMenu();
   });
 
-  el.mobileMenu.addEventListener('click', (e) => {
+ el.mobileMenu.addEventListener('click', (e) => {
     const item = e.target.closest('.mobile-menu-item');
     if (item) activateTab(item.dataset.tab);
   });
