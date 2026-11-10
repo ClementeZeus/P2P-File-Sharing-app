@@ -189,12 +189,6 @@
   let relayFallbackTimer = null;
   let relayAnnounced = false; // so the "using relay" log line only fires once per session
 
-  // JSON message types that are file-transfer control chatter riding the
-  // WS relay channel (as opposed to server.js's own signaling protocol:
-  // created/joined/peer-joined/peer-left/signal/error). Kept as a Set so
-  // routing ws.onmessage is a single lookup, not a chain of ifs.
-  const FILE_CONTROL_TYPES = new Set(['meta', 'end', 'verify-result']);
-
   /** Receiver-side accumulation state for the file currently inbound. */
   let inbound = null; // { name, size, mime, chunks: [], received, startTime }
 
@@ -401,11 +395,13 @@
         return logLine('received malformed signaling message', 'err');
       }
 
-      // File-control chatter (meta/end/verify-result) riding the relay
-      // channel also goes to handleIncomingMessage; everything else is
-      // server.js's own signaling protocol.
-      if (FILE_CONTROL_TYPES.has(msg.type)) {
-        return handleIncomingMessage({ data: event.data });
+      // File-control chatter (meta/end/verify-result) rides the relay
+      // channel wrapped in a 'relay' envelope — see sendFileControl().
+      // Unwrap it and hand the inner object to the exact same parser the
+      // WebRTC data channel path uses; everything NOT wrapped that way is
+      // server.js's own signaling protocol (created/joined/signal/...).
+      if (msg.type === 'relay') {
+        return handleIncomingMessage({ data: JSON.stringify(msg.data) });
       }
       handleSignalingMessage(msg);
     };
@@ -491,7 +487,7 @@
         handleRemoteSignal(msg.data);
         break;
 
-    case 'error':
+      case 'error':
         logLine(`server: ${msg.message}`, 'err');
         break;
 
@@ -698,6 +694,24 @@
     }
   }
 
+  /**
+   * Sends a file-transfer control message (meta/end/verify-result) over
+   * whichever transport is active. A WebRTC data channel only ever
+   * carries this app's own messages, so the control object goes out
+   * as-is. The WS relay channel is shared with server.js's own signaling
+   * protocol (create/join/signal/...), so a bare {type:'meta',...} sent
+   * there would hit server.js's `default` case and get rejected instead
+   * of relayed — it has to go out wrapped as {type:'relay', data:{...}},
+   * the same opaque-passthrough envelope 'signal' already gets. See the
+   * matching unwrap in ws.onmessage above.
+   */
+  function sendFileControl(obj) {
+    const payload = transportMode() === 'relay'
+      ? JSON.stringify({ type: 'relay', data: obj })
+      : JSON.stringify(obj);
+    transportSend(payload);
+  }
+
   function transportBufferedAmount() {
     const mode = transportMode();
     if (mode === 'webrtc') return dataChannel.bufferedAmount;
@@ -753,12 +767,12 @@
     }
 
     // Announce the incoming file so the receiver can prep its buffer.
-    transportSend(JSON.stringify({
+    sendFileControl({
       type: 'meta',
       name: file.name,
       size: file.size,
       mime: file.type || 'application/octet-stream',
-    }));
+    });
 
     logLine('hashing (sha-256)...', 'info');
     const hashBuffer = await crypto.subtle.digest('SHA-256', fileBuffer);
@@ -777,7 +791,7 @@
       return;
     }
 
-    transportSend(JSON.stringify({ type: 'end', hash: hashHex }));
+    sendFileControl({ type: 'end', hash: hashHex });
     updateTransferMetrics(file.size, file.size, startTime, true);
     setLinkActivity(false);
     logLine(`transfer complete — ${file.name} sent`, 'ok');
@@ -925,7 +939,7 @@
     // actually received or computed otherwise, and its own checksum/remote
     // hash fields would sit on "pending" forever without this.
     if (transportReady()) {
-      transportSend(JSON.stringify({ type: 'verify-result', hash: localHash, match }));
+      sendFileControl({ type: 'verify-result', hash: localHash, match });
     }
 
     setLinkActivity(false);
@@ -1015,7 +1029,7 @@
     if (e.key === 'Escape' && !el.mobileMenu.hidden) closeMobileMenu();
   });
 
- // Docs is the default landing tab; #app / #transfer and #ai deep-link directly.
+  // Docs is the default landing tab; #app / #transfer and #ai deep-link directly.
   activateTab(
     location.hash === '#app' || location.hash === '#transfer' ? 'app'
       : location.hash === '#ai' ? 'ai'
