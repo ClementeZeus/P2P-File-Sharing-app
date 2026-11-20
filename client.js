@@ -194,6 +194,35 @@
 
   let lastUiTick = 0;
 
+  // Timestamp (performance.now()) of the most recent completed transfer,
+  // either direction. Used to soften ICE/connection/data-channel teardown
+  // logging right after a transfer finishes.
+  //
+  // What was happening: nothing in this app calls pc.close() once a
+  // transfer is done, so the RTCPeerConnection just sits idle. With no
+  // more traffic flowing, a NAT/router on either end can quietly drop its
+  // UDP mapping for the ICE candidate pair, or the OS/browser can
+  // deprioritize a backgrounded tab's network stack — either way, the
+  // browser reports iceConnectionState 'disconnected' and then
+  // connectionState 'failed'/'closed' a moment later. That's completely
+  // normal post-transfer cleanup, not a real failure: the transfer itself
+  // already completed and was already logged as such. The old code logged
+  // every one of these as a loud 'err' line ("connection failed"), which
+  // reads as if something went wrong mid-transfer even though it didn't.
+  // This grace window just downgrades those specific log lines to 'info'
+  // when they land shortly after a completed transfer; it doesn't change
+  // any actual reconnect/fallback behavior.
+  let lastTransferDoneAt = 0;
+  const POST_TRANSFER_GRACE_MS = 5000;
+
+  function markTransferDone() {
+    lastTransferDoneAt = performance.now();
+  }
+
+  function justFinishedTransfer() {
+    return lastTransferDoneAt > 0 && (performance.now() - lastTransferDoneAt) < POST_TRANSFER_GRACE_MS;
+  }
+
   // =========================================================================
   // BOOT / LOADING SCREEN
   // =========================================================================
@@ -513,11 +542,19 @@
 
     pc.oniceconnectionstatechange = () => {
       if (!pc) return;
-      logLine(`ice state: ${pc.iceConnectionState}`, 'info');
-      if (pc.iceConnectionState === 'failed') {
-        reportLinkDown('ice handshake failed — peer may be behind a restrictive NAT');
+      const state = pc.iceConnectionState;
+      const teardownState = state === 'disconnected' || state === 'failed' || state === 'closed';
+
+      if (teardownState && justFinishedTransfer()) {
+        logLine(`ice state: ${state} (transfer already completed — idle link teardown, not an error)`, 'info');
+      } else {
+        logLine(`ice state: ${state}`, 'info');
       }
-      if (pc.iceConnectionState === 'disconnected') {
+
+      if (state === 'failed') {
+        reportLinkDown(justFinishedTransfer() ? null : 'ice handshake failed — peer may be behind a restrictive NAT');
+      }
+      if (state === 'disconnected') {
         reportLinkDown();
       }
     };
@@ -525,7 +562,11 @@
     pc.onconnectionstatechange = () => {
       if (!pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        logLine(`connection ${pc.connectionState}`, 'err');
+        if (justFinishedTransfer()) {
+          logLine(`connection ${pc.connectionState} (after completed transfer — safe to ignore)`, 'info');
+        } else {
+          logLine(`connection ${pc.connectionState}`, 'err');
+        }
         teardownPeerConnection();
         reportLinkDown();
       }
@@ -589,7 +630,11 @@
 
     channel.onclose = () => {
       setLinkActivity(false);
-      logLine('data channel closed', 'warn');
+      if (justFinishedTransfer()) {
+        logLine('data channel closed (transfer already completed)', 'info');
+      } else {
+        logLine('data channel closed', 'warn');
+      }
       reportLinkDown();
     };
 
@@ -742,6 +787,175 @@
   }
 
   // =========================================================================
+  // SECTION 2c — ZIP (pure-JS ZIP writer, "store" method / no compression,
+  // used to bundle multiple dropped/selected files into a single archive
+  // before handing them to the existing single-file TRANSFER pipeline
+  // below. No external library and no network fetch required — this is
+  // just the ZIP file format's local/central headers plus CRC-32.)
+  // =========================================================================
+
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function u16(n) { return new Uint8Array([n & 0xff, (n >>> 8) & 0xff]); }
+  function u32(n) {
+    return new Uint8Array([n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff]);
+  }
+
+  function concatBytes(parts) {
+    let len = 0;
+    for (const p of parts) len += p.length;
+    const out = new Uint8Array(len);
+    let offset = 0;
+    for (const p of parts) { out.set(p, offset); offset += p.length; }
+    return out;
+  }
+
+  // DOS date/time fields the ZIP format stores instead of a real timestamp.
+  function dosDateTime(date) {
+    const time = ((date.getHours() & 0x1f) << 11)
+      | ((date.getMinutes() & 0x3f) << 5)
+      | ((date.getSeconds() >> 1) & 0x1f);
+    const dosDate = (((Math.max(0, date.getFullYear() - 1980)) & 0x7f) << 9)
+      | (((date.getMonth() + 1) & 0xf) << 5)
+      | (date.getDate() & 0x1f);
+    return { time, dosDate };
+  }
+
+  /**
+   * Builds a single ZIP archive (as a Blob) from a list of File objects.
+   * Uses the "store" method (no compression) so it's fast and simple —
+   * fine for a tool whose whole job is moving bytes to a peer, where the
+   * link itself is the bottleneck, not archive size.
+   */
+  async function buildZip(files, onFile) {
+    const encoder = new TextEncoder();
+    const usedNames = new Set();
+
+    function uniqueEntryName(rawName, index) {
+      let base = (rawName || `file-${index + 1}`).replace(/\\/g, '/').split('/').pop();
+      if (!base) base = `file-${index + 1}`;
+      let candidate = base;
+      let n = 1;
+      while (usedNames.has(candidate)) {
+        const dot = base.lastIndexOf('.');
+        candidate = dot > 0 ? `${base.slice(0, dot)} (${n})${base.slice(dot)}` : `${base} (${n})`;
+        n += 1;
+      }
+      usedNames.add(candidate);
+      return candidate;
+    }
+
+    const parts = [];
+    const centralRecords = [];
+    let offset = 0;
+    const push = (bytes) => { parts.push(bytes); offset += bytes.length; };
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (onFile) onFile(i, files.length, file.name);
+
+      const nameBytes = encoder.encode(uniqueEntryName(file.name, i));
+      const data = new Uint8Array(await file.arrayBuffer());
+      const crc = crc32(data);
+      const { time, dosDate } = dosDateTime(new Date(file.lastModified || Date.now()));
+      const localOffset = offset;
+
+      push(concatBytes([
+        u32(0x04034b50), u16(20), u16(0), u16(0),
+        u16(time), u16(dosDate), u32(crc),
+        u32(data.length), u32(data.length),
+        u16(nameBytes.length), u16(0),
+      ]));
+      push(nameBytes);
+      push(data);
+
+      centralRecords.push(concatBytes([
+        u32(0x02014b50), u16(20), u16(20), u16(0), u16(0),
+        u16(time), u16(dosDate), u32(crc),
+        u32(data.length), u32(data.length),
+        u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0),
+        u32(localOffset),
+        nameBytes,
+      ]));
+    }
+
+    const centralOffset = offset;
+    for (const rec of centralRecords) push(rec);
+    const centralSize = offset - centralOffset;
+
+    push(concatBytes([
+      u32(0x06054b50),
+      u16(0), u16(0),
+      u16(centralRecords.length), u16(centralRecords.length),
+      u32(centralSize),
+      u32(centralOffset),
+      u16(0),
+    ]));
+
+    return new Blob(parts, { type: 'application/zip' });
+  }
+
+  function zipTimestampTag() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  /**
+   * Entry point for both the file picker and drag-and-drop: a single file
+   * goes straight to sendFile() unchanged; two or more are zipped into one
+   * archive first, so the peer gets one transfer with one checksum instead
+   * of a pile of concurrent/sequential sends.
+   */
+  async function queueFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+
+    if (files.length === 1) {
+      return sendFile(files[0]);
+    }
+
+    if (!transportReady()) {
+      logLine('no active peer link — create or join a room first', 'err');
+      return;
+    }
+
+    logLine(`zipping ${files.length} files into one archive...`, 'info');
+    let zipBlob;
+    try {
+      zipBlob = await buildZip(files, (index, total, name) => {
+        logLine(`adding to archive: ${name} (${index + 1}/${total})`, 'info');
+      });
+    } catch (err) {
+      logLine(`failed to build archive: ${err.message}`, 'err');
+      return;
+    }
+
+    const zipName = `files-${zipTimestampTag()}.zip`;
+    const zipFile = new File([zipBlob], zipName, { type: 'application/zip', lastModified: Date.now() });
+    logLine(`archive ready — ${zipName} (${formatBytes(zipFile.size)})`, 'ok');
+    return sendFile(zipFile);
+  }
+
+  // =========================================================================
   // SECTION 3 — TRANSFER (chunking, backpressure, hashing, download)
   // =========================================================================
 
@@ -790,6 +1004,7 @@
     sendFileControl({ type: 'end', hash: hashHex });
     updateTransferMetrics(file.size, file.size, startTime, true);
     setLinkActivity(false);
+    markTransferDone();
     logLine(`transfer complete — ${file.name} sent`, 'ok');
   }
 
@@ -939,6 +1154,7 @@
     }
 
     setLinkActivity(false);
+    markTransferDone();
     triggerDownload(blob, name);
     inbound = null;
   }
@@ -1093,7 +1309,7 @@
   });
 
   el.fileInput.addEventListener('change', () => {
-    if (el.fileInput.files[0]) sendFile(el.fileInput.files[0]);
+    if (el.fileInput.files.length) queueFiles(el.fileInput.files);
     el.fileInput.value = '';
   });
 
@@ -1112,8 +1328,7 @@
   );
 
   el.dropzone.addEventListener('drop', (e) => {
-    const file = e.dataTransfer.files[0];
-    if (file) sendFile(file);
+    if (e.dataTransfer.files && e.dataTransfer.files.length) queueFiles(e.dataTransfer.files);
   });
 
   // =========================================================================
