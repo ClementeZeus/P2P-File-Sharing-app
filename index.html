@@ -6,6 +6,9 @@
 <meta name="color-scheme" content="light">
 <title>P2P / Terminal — direct file transfer</title>
 <meta name="description" content="Send files straight from one browser to another over an encrypted WebRTC link. Nothing is stored on a server in between.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -311,9 +314,9 @@
               <path d="M12 15.5V4M12 4 7.2 8.8M12 4l4.8 4.8"></path>
               <path d="M4.5 15.5v3a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3"></path>
             </svg>
-            <span class="dropzone-text">Drop a file here, or click to browse</span>
-            <span class="dropzone-sub">Sent directly to your peer once a session is linked</span>
-            <input type="file" id="file-input" hidden>
+            <span class="dropzone-text">Drop files here, or click to browse</span>
+            <span class="dropzone-sub">Multiple files are auto-zipped into one archive before sending</span>
+            <input type="file" id="file-input" hidden multiple>
           </div>
         </section>
 
@@ -560,7 +563,7 @@
   <footer class="site-footer">
     <p>Chunked binary transfer over an RTCDataChannel. Every file is verified end to end with SHA-256.<br>Built with HTML, CSS, and JavaScript with<br>a lot of coffee ☕<br>Created by Zeus @2026.</p>
     <div class="footer-links">
-      <a class="btn-icon" href="https://github.com/ClementeZeus" target="_blank" rel="noopener noreferrer" title="GitHub / dev profile" aria-label="GitHub / dev profile">
+      <a class="btn-icon" href="https://github.com/clementezeusgabriel01-iswrtg" target="_blank" rel="noopener noreferrer" title="GitHub / dev profile" aria-label="GitHub / dev profile">
         <svg class="icon" viewBox="0 0 24 24">
           <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path>
         </svg>
