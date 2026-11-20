@@ -582,10 +582,9 @@
 
     channel.onopen = () => {
       clearTimeout(relayFallbackTimer);
-      const wasRelay = relayAnnounced;
       relayAnnounced = false;
       setPeerStatus('connected');
-      logLine(wasRelay ? 'direct data channel came up — switching off the relay' : 'data channel open — link established', 'ok');
+      logLine('data channel open — link established', 'ok');
     };
 
     channel.onclose = () => {
@@ -641,8 +640,7 @@
     if (reasonLog) logLine(reasonLog, 'err');
     if (peerPresent && ws && ws.readyState === WebSocket.OPEN) {
       relayAnnounced = true;
-      setPeerStatus('connected', 'relay');
-      logLine('direct link down — continuing over the server relay', 'warn');
+      setPeerStatus('connected');
     } else {
       setPeerStatus('lost');
     }
@@ -654,8 +652,7 @@
       if (dataChannel && dataChannel.readyState === 'open') return; // WebRTC made it — nothing to announce
       if (!peerPresent) return; // peer already left before this fired
       relayAnnounced = true;
-      setPeerStatus('connected', 'relay');
-      logLine(`direct link didn't come up within ${RELAY_FALLBACK_MS / 1000}s — shipping over the server relay instead`, 'warn');
+      setPeerStatus('connected');
     }, RELAY_FALLBACK_MS);
   }
 
@@ -685,8 +682,7 @@
       if (!relayAnnounced) {
         relayAnnounced = true;
         clearTimeout(relayFallbackTimer);
-        setPeerStatus('connected', 'relay');
-        logLine('shipping over the server relay (no direct link yet)', 'warn');
+        setPeerStatus('connected');
       }
       ws.send(data);
     } else {
