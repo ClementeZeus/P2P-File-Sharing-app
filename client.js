@@ -118,6 +118,10 @@
     roomCodeBox: $('room-code-box'),
     roomCodeValue: $('room-code-value'),
     btnCopy: $('btn-copy'),
+    btnCopyLink: $('btn-copy-link'),
+    btnQrToggle: $('btn-qr-toggle'),
+    qrPanel: $('room-qr-panel'),
+    qrCanvas: $('room-qr-canvas'),
     dropzone: $('dropzone'),
     fileInput: $('file-input'),
     log: $('terminal-log'),
@@ -188,6 +192,19 @@
   let peerPresent = false;
   let relayFallbackTimer = null;
   let relayAnnounced = false; // so the "using relay" log line only fires once per session
+
+  // Shareable join links look like #join=ABC234 — opening one should drop
+  // the person straight into the "app" tab and auto-join that room as soon
+  // as the signaling socket connects, without them typing the code in.
+  const JOIN_LINK_RE = /^#join=([A-Za-z0-9]{6})$/;
+  let pendingJoinCode = (() => {
+    const m = JOIN_LINK_RE.exec(location.hash);
+    return m ? m[1].toUpperCase() : null;
+  })();
+
+  function buildJoinLink(code) {
+    return `${location.origin}${location.pathname}#join=${code}`;
+  }
 
   /** Receiver-side accumulation state for the file currently inbound. */
   let inbound = null; // { name, size, mime, chunks: [], received, startTime }
@@ -406,6 +423,14 @@
       logLine(`signal channel open — ${SIGNALING_URL}`, 'ok');
       setBootStatus('Connected');
       finishBoot();
+
+      if (pendingJoinCode) {
+        const code = pendingJoinCode;
+        pendingJoinCode = null; // one-shot: don't re-auto-join on a later reconnect
+        el.inputJoinCode.value = code;
+        logLine(`joining room ${code} from shared link...`, 'info');
+        sendSignalingMessage({ type: 'join', roomId: code });
+      }
     };
 
     ws.onmessage = (event) => {
@@ -479,6 +504,9 @@
         isHost = true;
         el.roomCodeValue.textContent = roomId;
         el.roomCodeBox.classList.remove('hidden');
+        el.qrPanel.classList.add('hidden');
+        el.btnQrToggle.setAttribute('aria-expanded', 'false');
+        renderJoinQr(buildJoinLink(roomId));
         setPeerStatus('waiting');
         logLine(`room created — code ${roomId}`, 'ok');
         logLine('waiting for peer to join...', 'info');
@@ -956,6 +984,428 @@
   }
 
   // =========================================================================
+  // SECTION 2d — QR (pure-JS QR Code encoder, Byte mode, EC level L,
+  // versions 1-10 — implements ISO/IEC 18004 directly: GF(256)
+  // Reed-Solomon, BCH format/version info computed algorithmically rather
+  // than copied from a table, standard module placement and mask scoring.
+  // No external library, no CDN — same "no dependency" approach as the
+  // ZIP builder above. Used to render the room's shareable join link as a
+  // scannable code next to the room code.
+  // =========================================================================
+
+  const QR_TABLE_L = {
+    1:  [19,  7, 1, 19, 0, 0],
+    2:  [34, 10, 1, 34, 0, 0],
+    3:  [55, 15, 1, 55, 0, 0],
+    4:  [80, 20, 1, 80, 0, 0],
+    5:  [108,26, 1,108, 0, 0],
+    6:  [136,18, 2, 68, 0, 0],
+    7:  [156,20, 2, 78, 0, 0],
+    8:  [194,24, 2, 97, 0, 0],
+    9:  [232,30, 2,116, 0, 0],
+    10: [274,18, 2, 68, 2, 69],
+  };
+
+  const QR_ALIGNMENT_COORDS = {
+    2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+    7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50],
+  };
+
+  function qrModuleCount(version) { return 17 + 4 * version; }
+
+  const QR_GF_EXP = new Uint8Array(512);
+  const QR_GF_LOG = new Uint8Array(256);
+  (function initQrGF() {
+    let x = 1;
+    for (let i = 0; i < 255; i++) {
+      QR_GF_EXP[i] = x;
+      QR_GF_LOG[x] = i;
+      x <<= 1;
+      if (x & 0x100) x ^= 0x11d;
+    }
+    for (let i = 255; i < 512; i++) QR_GF_EXP[i] = QR_GF_EXP[i - 255];
+  })();
+
+  function qrGfMul(a, b) {
+    if (a === 0 || b === 0) return 0;
+    return QR_GF_EXP[QR_GF_LOG[a] + QR_GF_LOG[b]];
+  }
+
+  function qrRsGeneratorPoly(degree) {
+    // Big-endian coefficients: index 0 is the leading (always-1) term,
+    // built by repeatedly multiplying by (x + alpha^i) in GF(2).
+    let poly = [1];
+    for (let i = 0; i < degree; i++) {
+      const next = new Array(poly.length + 1).fill(0);
+      for (let j = 0; j < poly.length; j++) {
+        next[j] ^= poly[j];
+        next[j + 1] ^= qrGfMul(poly[j], QR_GF_EXP[i]);
+      }
+      poly = next;
+    }
+    return poly;
+  }
+
+  function qrRsEncode(dataBytes, ecLen) {
+    const gen = qrRsGeneratorPoly(ecLen);
+    const buf = Array.from(dataBytes).concat(new Array(ecLen).fill(0));
+    for (let i = 0; i < dataBytes.length; i++) {
+      const coef = buf[i];
+      if (coef === 0) continue;
+      for (let j = 0; j < gen.length; j++) buf[i + j] ^= qrGfMul(gen[j], coef);
+    }
+    return buf.slice(dataBytes.length);
+  }
+
+  function qrBchDigitCount(n) {
+    let d = 0;
+    while (n !== 0) { d++; n >>>= 1; }
+    return d;
+  }
+
+  function qrBchEncode(data, generator) {
+    const genDigits = qrBchDigitCount(generator);
+    let d = data << (genDigits - 1);
+    while (qrBchDigitCount(d) >= genDigits) {
+      d ^= generator << (qrBchDigitCount(d) - genDigits);
+    }
+    return d;
+  }
+
+  function qrFormatInfoBits(eccBits, maskPattern) {
+    const data = (eccBits << 3) | maskPattern;
+    const rem = qrBchEncode(data, 0b10100110111); // x^10+x^8+x^5+x^4+x^2+x+1
+    return ((data << 10) | rem) ^ 0b101010000010010;
+  }
+
+  function qrVersionInfoBits(version) {
+    const rem = qrBchEncode(version, 0b1111100100101);
+    return (version << 12) | rem;
+  }
+
+  function qrCharCountBits(version) { return version <= 9 ? 8 : 16; }
+
+  function qrPickVersion(byteLen) {
+    for (let v = 1; v <= 10; v++) {
+      const totalDataCodewords = QR_TABLE_L[v][0];
+      const headerBits = 4 + qrCharCountBits(v);
+      const capacityBits = totalDataCodewords * 8;
+      const neededBits = headerBits + byteLen * 8 + 4; // +4 upper-bound terminator
+      if (neededBits <= capacityBits) return v;
+    }
+    return null; // link too long for this encoder (max ~213 bytes at version 10-L)
+  }
+
+  function qrBuildDataCodewords(bytes, version) {
+    const totalDataCodewords = QR_TABLE_L[version][0];
+    const bits = [];
+    const put = (value, length) => { for (let i = length - 1; i >= 0; i--) bits.push((value >>> i) & 1); };
+    put(0b0100, 4); // byte mode
+    put(bytes.length, qrCharCountBits(version));
+    for (const b of bytes) put(b, 8);
+
+    const capacityBits = totalDataCodewords * 8;
+    const term = Math.min(4, capacityBits - bits.length);
+    if (term > 0) put(0, term);
+    while (bits.length % 8 !== 0) bits.push(0);
+
+    const codewords = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let byte = 0;
+      for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
+      codewords.push(byte);
+    }
+    const PAD_BYTES = [0xec, 0x11];
+    let p = 0;
+    while (codewords.length < totalDataCodewords) codewords.push(PAD_BYTES[p++ % 2]);
+    return codewords;
+  }
+
+  function qrSplitBlocksAndInterleave(dataCodewords, version) {
+    const [, ecLen, g1Count, g1Len, g2Count, g2Len] = QR_TABLE_L[version];
+    const blocks = [];
+    let offset = 0;
+    for (let i = 0; i < g1Count; i++) { blocks.push(dataCodewords.slice(offset, offset + g1Len)); offset += g1Len; }
+    for (let i = 0; i < g2Count; i++) { blocks.push(dataCodewords.slice(offset, offset + g2Len)); offset += g2Len; }
+    const ecBlocks = blocks.map((blk) => qrRsEncode(blk, ecLen));
+
+    const maxDataLen = Math.max(...blocks.map((b) => b.length));
+    const finalData = [];
+    for (let i = 0; i < maxDataLen; i++) for (const blk of blocks) if (i < blk.length) finalData.push(blk[i]);
+    const finalEc = [];
+    for (let i = 0; i < ecLen; i++) for (const ec of ecBlocks) finalEc.push(ec[i]);
+    return finalData.concat(finalEc);
+  }
+
+  function qrMakeMatrix(version) {
+    const n = qrModuleCount(version);
+    const matrix = [];
+    const reserved = [];
+    for (let i = 0; i < n; i++) { matrix.push(new Array(n).fill(0)); reserved.push(new Array(n).fill(false)); }
+    return { n, matrix, reserved };
+  }
+
+  function qrSetModule(ctx, r, c, val) {
+    ctx.matrix[r][c] = val ? 1 : 0;
+    ctx.reserved[r][c] = true;
+  }
+
+  function qrPlaceFinder(ctx, r0, c0) {
+    for (let dr = -1; dr <= 7; dr++) {
+      for (let dc = -1; dc <= 7; dc++) {
+        const r = r0 + dr, c = c0 + dc;
+        if (r < 0 || c < 0 || r >= ctx.n || c >= ctx.n) continue;
+        const isBorder = dr === -1 || dr === 7 || dc === -1 || dc === 7;
+        const isOuterRing = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 && (dr === 0 || dr === 6 || dc === 0 || dc === 6);
+        const isCore = dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4;
+        qrSetModule(ctx, r, c, !isBorder && (isOuterRing || isCore));
+      }
+    }
+  }
+
+  function qrPlaceAlignmentPatterns(ctx, version) {
+    const coords = QR_ALIGNMENT_COORDS[version];
+    if (!coords) return;
+    const n = ctx.n;
+    for (const r of coords) {
+      for (const c of coords) {
+        if ((r <= 8 && c <= 8) || (r <= 8 && c >= n - 9) || (r >= n - 9 && c <= 8)) continue;
+        for (let dr = -2; dr <= 2; dr++) {
+          for (let dc = -2; dc <= 2; dc++) {
+            const isRing = Math.max(Math.abs(dr), Math.abs(dc)) === 2;
+            qrSetModule(ctx, r + dr, c + dc, isRing || (dr === 0 && dc === 0));
+          }
+        }
+      }
+    }
+  }
+
+  function qrPlaceTimingPatterns(ctx) {
+    const n = ctx.n;
+    for (let i = 8; i < n - 8; i++) {
+      if (!ctx.reserved[6][i]) qrSetModule(ctx, 6, i, i % 2 === 0);
+      if (!ctx.reserved[i][6]) qrSetModule(ctx, i, 6, i % 2 === 0);
+    }
+  }
+
+  function qrReserveFormatAreas(ctx) {
+    const n = ctx.n;
+    for (let i = 0; i <= 8; i++) { ctx.reserved[8][i] = true; ctx.reserved[i][8] = true; }
+    for (let i = 0; i < 8; i++) { ctx.reserved[8][n - 1 - i] = true; ctx.reserved[n - 1 - i][8] = true; }
+    qrSetModule(ctx, n - 8, 8, true); // the always-dark module
+  }
+
+  function qrReserveVersionAreas(ctx, version) {
+    if (version < 7) return;
+    const n = ctx.n;
+    for (let i = 0; i < 6; i++) {
+      for (let j = 0; j < 3; j++) {
+        ctx.reserved[i][n - 11 + j] = true;
+        ctx.reserved[n - 11 + j][i] = true;
+      }
+    }
+  }
+
+  function qrPlaceFormatInfo(ctx, bits) {
+    const n = ctx.n;
+    const bitAt = (i) => (bits >>> i) & 1;
+    for (let i = 0; i <= 5; i++) qrSetModule(ctx, i, 8, bitAt(i));
+    qrSetModule(ctx, 7, 8, bitAt(6));
+    qrSetModule(ctx, 8, 8, bitAt(7));
+    qrSetModule(ctx, 8, 7, bitAt(8));
+    for (let i = 9; i <= 14; i++) qrSetModule(ctx, 8, 14 - i, bitAt(i));
+    for (let i = 0; i <= 7; i++) qrSetModule(ctx, 8, n - 1 - i, bitAt(i));
+    for (let i = 8; i <= 14; i++) qrSetModule(ctx, n - 15 + i, 8, bitAt(i));
+  }
+
+  function qrPlaceVersionInfo(ctx, version) {
+    if (version < 7) return;
+    const bits = qrVersionInfoBits(version);
+    const n = ctx.n;
+    const bitAt = (i) => (bits >>> i) & 1;
+    for (let i = 0; i < 18; i++) {
+      const row = Math.floor(i / 3), col = i % 3;
+      qrSetModule(ctx, n - 11 + col, row, bitAt(i));
+      qrSetModule(ctx, row, n - 11 + col, bitAt(i));
+    }
+  }
+
+  function qrMaskFn(pattern, r, c) {
+    switch (pattern) {
+      case 0: return (r + c) % 2 === 0;
+      case 1: return r % 2 === 0;
+      case 2: return c % 3 === 0;
+      case 3: return (r + c) % 3 === 0;
+      case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+      case 5: return (r * c) % 2 + (r * c) % 3 === 0;
+      case 6: return ((r * c) % 2 + (r * c) % 3) % 2 === 0;
+      case 7: return ((r + c) % 2 + (r * c) % 3) % 2 === 0;
+      default: return false;
+    }
+  }
+
+  function qrPlaceDataBits(ctx, allCodewords) {
+    const n = ctx.n;
+    const bits = [];
+    for (const byte of allCodewords) for (let i = 7; i >= 0; i--) bits.push((byte >>> i) & 1);
+    let bitIndex = 0;
+    let col = n - 1;
+    while (col >= 1) {
+      if (col === 6) col = 5; // column 6 is entirely the vertical timing pattern
+      const upward = ((col + 1) & 2) === 0;
+      for (let i = 0; i < n; i++) {
+        const row = upward ? n - 1 - i : i;
+        for (const c of [col, col - 1]) {
+          if (ctx.reserved[row][c]) continue;
+          ctx.matrix[row][c] = bitIndex < bits.length ? bits[bitIndex] : 0;
+          bitIndex++;
+        }
+      }
+      col -= 2;
+    }
+  }
+
+  function qrCollectDataMask(ctx) {
+    const n = ctx.n;
+    const mask = [];
+    for (let r = 0; r < n; r++) {
+      mask.push(new Array(n).fill(false));
+      for (let c = 0; c < n; c++) mask[r][c] = !ctx.reserved[r][c];
+    }
+    return mask;
+  }
+
+  function qrApplyMask(ctx, dataMask, pattern) {
+    const n = ctx.n;
+    const out = ctx.matrix.map((row) => row.slice());
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        if (dataMask[r][c] && qrMaskFn(pattern, r, c)) out[r][c] ^= 1;
+      }
+    }
+    return out;
+  }
+
+  function qrPenaltyScore(m) {
+    const n = m.length;
+    let score = 0;
+    for (let r = 0; r < n; r++) {
+      let runColor = m[r][0], runLen = 1;
+      for (let c = 1; c < n; c++) {
+        if (m[r][c] === runColor) { runLen++; } else { if (runLen >= 5) score += 3 + (runLen - 5); runColor = m[r][c]; runLen = 1; }
+      }
+      if (runLen >= 5) score += 3 + (runLen - 5);
+    }
+    for (let c = 0; c < n; c++) {
+      let runColor = m[0][c], runLen = 1;
+      for (let r = 1; r < n; r++) {
+        if (m[r][c] === runColor) { runLen++; } else { if (runLen >= 5) score += 3 + (runLen - 5); runColor = m[r][c]; runLen = 1; }
+      }
+      if (runLen >= 5) score += 3 + (runLen - 5);
+    }
+    for (let r = 0; r < n - 1; r++) {
+      for (let c = 0; c < n - 1; c++) {
+        const v = m[r][c];
+        if (v === m[r][c + 1] && v === m[r + 1][c] && v === m[r + 1][c + 1]) score += 3;
+      }
+    }
+    const pattern1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+    const pattern2 = [0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1];
+    const matchesAt = (arr, idx, pat) => {
+      for (let i = 0; i < pat.length; i++) if (arr[idx + i] !== pat[i]) return false;
+      return true;
+    };
+    for (let r = 0; r < n; r++) {
+      const row = m[r];
+      for (let c = 0; c <= n - 11; c++) {
+        if (matchesAt(row, c, pattern1) || matchesAt(row, c, pattern2)) score += 40;
+      }
+    }
+    for (let c = 0; c < n; c++) {
+      const col = m.map((row) => row[c]);
+      for (let r = 0; r <= n - 11; r++) {
+        if (matchesAt(col, r, pattern1) || matchesAt(col, r, pattern2)) score += 40;
+      }
+    }
+    let dark = 0;
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (m[r][c]) dark++;
+    const percent = (dark * 100) / (n * n);
+    const prevMultiple = Math.floor(percent / 5) * 5;
+    score += Math.min(Math.abs(prevMultiple - 50) / 5, Math.abs(prevMultiple + 5 - 50) / 5) * 10;
+    return score;
+  }
+
+  /** Encodes `text` (Byte mode, EC level L) into a { version, size, matrix } QR code. */
+  function encodeQR(text) {
+    const bytes = Array.from(new TextEncoder().encode(text));
+    const version = qrPickVersion(bytes.length);
+    if (!version) throw new Error('link too long to encode as a QR code');
+
+    const dataCodewords = qrBuildDataCodewords(bytes, version);
+    const allCodewords = qrSplitBlocksAndInterleave(dataCodewords, version);
+
+    const ctx = qrMakeMatrix(version);
+    qrPlaceFinder(ctx, 0, 0);
+    qrPlaceFinder(ctx, 0, ctx.n - 7);
+    qrPlaceFinder(ctx, ctx.n - 7, 0);
+    qrPlaceAlignmentPatterns(ctx, version);
+    qrPlaceTimingPatterns(ctx);
+    qrReserveFormatAreas(ctx);
+    qrReserveVersionAreas(ctx, version);
+    qrPlaceVersionInfo(ctx, version);
+
+    const dataMask = qrCollectDataMask(ctx);
+    qrPlaceDataBits(ctx, allCodewords);
+
+    let best = null, bestScore = Infinity, bestPattern = 0;
+    for (let p = 0; p < 8; p++) {
+      const masked = qrApplyMask(ctx, dataMask, p);
+      const s = qrPenaltyScore(masked);
+      if (s < bestScore) { bestScore = s; best = masked; bestPattern = p; }
+    }
+
+    const finalCtx = { n: ctx.n, matrix: best, reserved: ctx.reserved };
+    qrPlaceFormatInfo(finalCtx, qrFormatInfoBits(0b01, bestPattern));
+    qrPlaceVersionInfo(finalCtx, version); // version info isn't masked — re-stamp after copying
+    return { version, size: ctx.n, matrix: best };
+  }
+
+  /** Renders `text` as a QR code onto el.qrCanvas, with a standard 4-module quiet zone. */
+  function renderJoinQr(text) {
+    let result;
+    try {
+      result = encodeQR(text);
+    } catch (err) {
+      logLine(`could not generate QR code: ${err.message}`, 'warn');
+      return;
+    }
+    const { size, matrix } = result;
+    const quiet = 4;
+    const canvas = el.qrCanvas;
+    const px = canvas.width; // square canvas, CSS scales it to fit the panel
+    const moduleSize = Math.max(1, Math.floor(px / (size + quiet * 2)));
+    const totalSize = moduleSize * (size + quiet * 2);
+    const offset = Math.floor((px - totalSize) / 2);
+
+    const ctx2d = canvas.getContext('2d');
+    ctx2d.clearRect(0, 0, px, px);
+    ctx2d.fillStyle = '#ffffff';
+    ctx2d.fillRect(0, 0, px, px);
+    ctx2d.fillStyle = '#11151c';
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (!matrix[r][c]) continue;
+        ctx2d.fillRect(
+          offset + (c + quiet) * moduleSize,
+          offset + (r + quiet) * moduleSize,
+          moduleSize,
+          moduleSize
+        );
+      }
+    }
+  }
+
+  // =========================================================================
   // SECTION 3 — TRANSFER (chunking, backpressure, hashing, download)
   // =========================================================================
 
@@ -1241,9 +1691,11 @@
     if (e.key === 'Escape' && !el.mobileMenu.hidden) closeMobileMenu();
   });
 
-  // Docs is the default landing tab; #app / #transfer and #ai deep-link directly.
+  // Docs is the default landing tab; #app / #transfer and #ai deep-link
+  // directly. A #join=XXXXXX shareable link also lands on "app", since
+  // that's where the auto-join happens once signaling connects.
   activateTab(
-    location.hash === '#app' || location.hash === '#transfer' ? 'app'
+    location.hash === '#app' || location.hash === '#transfer' || JOIN_LINK_RE.test(location.hash) ? 'app'
       : location.hash === '#ai' ? 'ai'
       : location.hash === '#speed' ? 'speed'
       : 'docs'
@@ -1282,6 +1734,19 @@
   el.btnCopy.addEventListener('click', async () => {
     const ok = await copyToClipboard(roomId, 'room code copied to clipboard');
     if (ok) flashCopied(el.btnCopy);
+  });
+
+  el.btnCopyLink.addEventListener('click', async () => {
+    if (!roomId) return;
+    const ok = await copyToClipboard(buildJoinLink(roomId), 'join link copied to clipboard');
+    if (ok) flashCopied(el.btnCopyLink);
+  });
+
+  el.btnQrToggle.addEventListener('click', () => {
+    const showing = !el.qrPanel.classList.contains('hidden');
+    el.qrPanel.classList.toggle('hidden', showing);
+    el.btnQrToggle.setAttribute('aria-expanded', String(!showing));
+    if (!showing && roomId) renderJoinQr(buildJoinLink(roomId));
   });
 
   el.btnCopyLocalHash.addEventListener('click', async () => {
