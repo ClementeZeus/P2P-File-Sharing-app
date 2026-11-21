@@ -858,7 +858,7 @@ button, input {
 .btn-icon-small .icon { width: 15px; height: 15px; }
 
 .btn-icon .icon-check { display: none; color: var(--good); }
-.btn-icon.copied .icon-copy { display: none; }
+.btn-icon.copied .icon:not(.icon-check) { display: none; }
 .btn-icon.copied .icon-check { display: block; }
 .btn-icon.copied { border-color: var(--good); }
 
