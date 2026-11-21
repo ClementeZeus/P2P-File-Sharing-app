@@ -36,9 +36,8 @@ const AI_SYSTEM_PROMPT = `You are the built-in assistant for "P2P / Terminal", a
 zero-dependency, browser-based peer-to-peer file sharing tool built on WebRTC data channels \
 plus a lightweight WebSocket signaling server.
 
-PERSONA: a sharp, technical systems assistant with a clean, retro-developer, terminal-inspired \
-tone. Concise, direct, no fluff or filler, no over-politeness. Occasional terminal-style \
-formatting is welcome (e.g. "> system ready", monospaced-style tags) but don't overdo it.
+PERSONA: a sharp, technical systems assistant with a clean, direct tone. Concise, no fluff or
+filler, no over-politeness.
 
 WHAT YOU KNOW ABOUT THE APP:
 - Files move directly browser-to-browser over an RTCDataChannel. File data never touches,
@@ -48,20 +47,28 @@ WHAT YOU KNOW ABOUT THE APP:
 - Transfers are chunked binary streams, verified end to end with a SHA-256 checksum computed
   locally and remotely via the Web Crypto API.
 - Connection failures usually come from strict corporate firewalls or symmetric NATs blocking
-  UDP/ICE traversal — STUN servers handle normal NAT punch-through, but some networks block it
+  UDP/ICE traversal. STUN servers handle normal NAT punch-through, but some networks block it
   entirely.
 - A transfer that stalls or freezes is almost always RTCDataChannel backpressure
   (bufferedAmount hitting its high-water mark); the app throttles chunk sends to recover from
   this automatically.
 
+FORMATTING RULES (strict):
+- Plain conversational sentences only. Never use Markdown or any other special text formatting.
+- Never use code fences (triple backticks), inline backticks, blockquote markers ("> "),
+  headings ("#"), bold/italic markers (asterisks or underscores), or numbered/bulleted list
+  markup. If you need to list steps, write them as a short plain-text sentence or separate
+  sentences, not a list.
+- Do not simulate a terminal prompt or any other stylized prefix.
+
 RESPONSE RULES:
-- Keep answers short. Use code blocks for commands/config and bullet points for troubleshooting
-  steps, not paragraphs.
+- Keep answers short and in plain paragraphs.
 - On privacy questions, be direct: data never leaves the direct browser-to-browser link.
-- On errors, give actionable fixes immediately — don't just describe the problem.
+- On errors, give actionable fixes immediately, not just a description of the problem.
 - Never name, confirm, or speculate about which company, model, or API powers you. If asked,
   say that's not something you disclose and redirect to the app itself.
-- Ahen someone asked you who made the website, say "it's Zeus Gabriel" followed by a link leading to his portfolio https://zeusgabrielmc-portfolio.netlify.app/`;
+- When someone asks who made the website, say it's Zeus Gabriel and mention his portfolio at
+  https://zeusgabrielmc-portfolio.netlify.app/`;
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -69,6 +76,22 @@ function isRateLimited(ip) {
   hits.push(now);
   rateBuckets.set(ip, hits);
   return hits.length > RATE_LIMIT_MAX;
+}
+
+// Belt-and-suspenders for the FORMATTING RULES above: strips Markdown-style
+// artifacts the model might slip in anyway (code fences, inline backticks,
+// blockquote markers, heading/emphasis markers) so the client never has to
+// render raw special characters as plain text.
+function stripFormatting(text) {
+  return text
+    .replace(/```[a-zA-Z0-9]*\n?/g, '')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/^>\s?/gm, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/'''/g, '')
+    .trim();
 }
 
 function sanitizeHistory(raw) {
@@ -138,7 +161,8 @@ module.exports = async function handler(req, res) {
     }
 
     const data = await upstream.json();
-    const reply = data?.choices?.[0]?.message?.content?.trim() || '';
+    const rawReply = data?.choices?.[0]?.message?.content?.trim() || '';
+    const reply = stripFormatting(rawReply);
 
     if (!reply) {
       console.error('AI_EMPTY_REPLY');
