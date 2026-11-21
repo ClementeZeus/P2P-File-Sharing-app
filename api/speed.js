@@ -35,6 +35,25 @@
 const { parse } = require('url');
 const crypto = require('crypto');
 
+// The platform's default body parser only recognizes a handful of
+// Content-Type values (json/urlencoded/text) and, for anything else,
+// applies its own size ceiling before our code ever runs. The upload leg
+// of this test sends a raw application/octet-stream body, which falls
+// outside that recognized set, so every upload request was being rejected
+// before handleUpload() could see it. The client still counted the bytes
+// it attempted to send locally, but the response it measured against (and
+// the figure this endpoint reported) never reflected a real transfer,
+// which is why the Upload result stayed pinned at 0.00 Mbps. Turning the
+// built-in parser off and reading the request stream ourselves below
+// fixes both problems: no surprise size limit, and a byte count that
+// reflects what the server actually received for any content type.
+module.exports.config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};
+
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;   // 4 MiB — safely under the 4.5 MB platform cap
 const MIN_CHUNK_BYTES = 16 * 1024;         // floor so a bad "n" can't make a near-empty request
 const RATE_LIMIT_WINDOW_MS = 3 * 60 * 1000;
@@ -72,16 +91,37 @@ function handleDownload(req, res, query) {
   return res.status(200).send(pool.subarray(0, size));
 }
 
-function handleUpload(req, res) {
-  const body = req.body;
-  let bytes = 0;
-  if (Buffer.isBuffer(body)) bytes = body.length;
-  else if (typeof body === 'string') bytes = Buffer.byteLength(body);
-  else if (body && typeof body === 'object') {
-    try { bytes = Buffer.byteLength(JSON.stringify(body)); } catch { bytes = 0; }
+// Reads the raw request body ourselves (bodyParser is turned off above),
+// so this works the same regardless of what Content-Type the client sent.
+// Aborts once MAX_CHUNK_BYTES is exceeded rather than buffering an
+// unbounded stream in memory.
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(Object.assign(new Error('Payload too large.'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function handleUpload(req, res) {
+  try {
+    const body = await readRawBody(req, MAX_CHUNK_BYTES);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).json({ bytes: body.length });
+  } catch (err) {
+    const status = err.statusCode || 400;
+    return res.status(status).json({ error: err.message || 'Upload failed.' });
   }
-  res.setHeader('Cache-Control', 'no-store');
-  return res.status(200).json({ bytes });
 }
 
 module.exports = async function handler(req, res) {
