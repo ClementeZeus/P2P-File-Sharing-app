@@ -378,6 +378,25 @@ button, input {
   max-width: 56ch;
 }
 
+/* Justified body copy reads as a deliberate, typeset page rather than a
+   ragged-edge web paragraph. Scoped to the Docs tab's prose only (intro,
+   section paragraphs, step/list items, walkthrough captions) so the SVG
+   screenshot mockups elsewhere on the page are completely untouched: SVG
+   <text> doesn't participate in CSS text-align the way these do anyway,
+   but the selectors below are written to only ever reach HTML copy.
+   text-align-last keeps a short final line from being stretched edge to
+   edge, and hyphens avoids ugly gaps in narrow justified lines. */
+.docs-intro,
+.docs-section p,
+.docs-steps li,
+.docs-list li,
+.walkthrough-step figcaption {
+  text-align: justify;
+  text-align-last: left;
+  -webkit-hyphens: auto;
+  hyphens: auto;
+}
+
 .docs-section { margin-bottom: calc(var(--u) * 8); }
 
 .docs-section h2 {
@@ -954,10 +973,27 @@ button, input {
   color: var(--ink-dim);
   margin-top: 3px;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 4px;
   gap: 6px;
 }
 
 .file-meta-dot { color: var(--ink-faint); }
+
+.file-meta-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ink-dim);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px calc(var(--u) * 2);
+  margin-left: 2px;
+}
+
+.file-meta-badge.hidden { display: none; }
 
 .progress-track {
   margin-top: calc(var(--u) * 4);
@@ -995,10 +1031,18 @@ button, input {
 .metric-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: calc(var(--u) * 4) 0;
+  gap: calc(var(--u) * 5) calc(var(--u) * 6);
   margin-top: calc(var(--u) * 6);
   padding-top: calc(var(--u) * 5);
   border-top: 1px solid var(--border);
+}
+
+/* Keeps the two columns reading as an aligned table rather than two
+   independent lists: every label sits a fixed distance above its value,
+   and the column gap above gives them clear daylight from each other. */
+.metric {
+  display: flex;
+  flex-direction: column;
 }
 
 .metric-label {
