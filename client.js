@@ -240,6 +240,24 @@
     return lastTransferDoneAt > 0 && (performance.now() - lastTransferDoneAt) < POST_TRANSFER_GRACE_MS;
   }
 
+  // True whenever the WS relay is available as a transport (same check
+  // reportLinkDown() uses to decide the status badge). When this is true,
+  // a WebRTC/ICE failure doesn't actually take the link down — transportSend()
+  // just keeps using the relay — so it isn't something to alarm the user about.
+  function hasRelayFallback() {
+    return peerPresent && ws && ws.readyState === WebSocket.OPEN;
+  }
+
+  // Returns a short explanatory clause for a WebRTC teardown event, or null
+  // if there's no good explanation and it really is worth flagging to the
+  // user. Centralizes the "is this actually a problem" judgment so the ICE
+  // handler, connection-state handler, and data-channel handler all agree.
+  function describeLinkTeardown() {
+    if (justFinishedTransfer()) return 'transfer already completed — idle link teardown, not an error';
+    if (hasRelayFallback()) return 'falling back to the relay link — still connected, nothing to worry about';
+    return null;
+  }
+
   // =========================================================================
   // BOOT / LOADING SCREEN
   // =========================================================================
@@ -572,15 +590,12 @@
       if (!pc) return;
       const state = pc.iceConnectionState;
       const teardownState = state === 'disconnected' || state === 'failed' || state === 'closed';
+      const benign = teardownState ? describeLinkTeardown() : null;
 
-      if (teardownState && justFinishedTransfer()) {
-        logLine(`ice state: ${state} (transfer already completed — idle link teardown, not an error)`, 'info');
-      } else {
-        logLine(`ice state: ${state}`, 'info');
-      }
+      logLine(benign ? `ice state: ${state} (${benign})` : `ice state: ${state}`, 'info');
 
       if (state === 'failed') {
-        reportLinkDown(justFinishedTransfer() ? null : 'ice handshake failed — peer may be behind a restrictive NAT');
+        reportLinkDown(benign ? null : 'ice handshake failed — peer may be behind a restrictive NAT');
       }
       if (state === 'disconnected') {
         reportLinkDown();
@@ -590,8 +605,9 @@
     pc.onconnectionstatechange = () => {
       if (!pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        if (justFinishedTransfer()) {
-          logLine(`connection ${pc.connectionState} (after completed transfer — safe to ignore)`, 'info');
+        const benign = describeLinkTeardown();
+        if (benign) {
+          logLine(`connection ${pc.connectionState} (${benign})`, 'info');
         } else {
           logLine(`connection ${pc.connectionState}`, 'err');
         }
@@ -658,8 +674,9 @@
 
     channel.onclose = () => {
       setLinkActivity(false);
-      if (justFinishedTransfer()) {
-        logLine('data channel closed (transfer already completed)', 'info');
+      const benign = describeLinkTeardown();
+      if (benign) {
+        logLine(`data channel closed (${benign})`, 'info');
       } else {
         logLine('data channel closed', 'warn');
       }
