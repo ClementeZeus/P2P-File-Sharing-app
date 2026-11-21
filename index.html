@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light">
-<title>P2P / Terminal — direct file transfer</title>
+<title>P2P / Terminal: direct file transfer</title>
 <meta name="description" content="Send files straight from one browser to another over an encrypted WebRTC link. Nothing is stored on a server in between.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="any">
@@ -170,7 +170,7 @@
               <rect x="24" y="22" width="472" height="62" rx="9" fill="#f6f7f9" stroke="#cfd4dc" stroke-dasharray="6 5"/>
               <rect x="42" y="38" width="22" height="28" rx="3" fill="none" stroke="#5b6372" stroke-width="2"/>
               <path d="M55 38 L64 47 L55 47 Z" fill="#5b6372"/>
-              <text x="78" y="57" font-family="IBM Plex Sans, sans-serif" font-size="13" fill="#5b6372">report.pdf &#8212; drop to send</text>
+              <text x="78" y="57" font-family="IBM Plex Sans, sans-serif" font-size="13" fill="#5b6372">report.pdf &#183; drop to send</text>
               <rect x="24" y="100" width="472" height="10" rx="5" fill="#eef1fd"/>
               <rect x="24" y="100" width="300" height="10" rx="5" fill="#2951e3"/>
               <text x="24" y="130" font-family="IBM Plex Mono, monospace" font-size="12" fill="#5b6372">63% &#183; 11.4 MB/s &#183; 4s left</text>
@@ -373,11 +373,14 @@
 
           <div class="transfer-body" id="transfer-body">
             <div class="file-meta">
-              <div class="file-meta-name" id="stat-filename">—</div>
+              <div class="file-meta-name" id="stat-filename">--</div>
               <div class="file-meta-sub">
                 <span id="stat-direction">Idle</span>
                 <span class="file-meta-dot">&#183;</span>
                 <span id="stat-filesize">0 B</span>
+                <span class="file-meta-dot">&#183;</span>
+                <span id="stat-filetype">--</span>
+                <span class="file-meta-badge hidden" id="stat-filecount">1 file</span>
               </div>
             </div>
 
@@ -396,7 +399,7 @@
               </div>
               <div class="metric">
                 <div class="metric-label">Time left</div>
-                <div class="metric-value" id="stat-eta">—</div>
+                <div class="metric-value" id="stat-eta">--</div>
               </div>
               <div class="metric">
                 <div class="metric-label">Chunk size</div>
@@ -406,13 +409,29 @@
                 <div class="metric-label">Checksum</div>
                 <div class="metric-value wait" id="stat-checksum">pending</div>
               </div>
+              <div class="metric">
+                <div class="metric-label">Transport</div>
+                <div class="metric-value" id="stat-transport">--</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Duration</div>
+                <div class="metric-value" id="stat-duration">00:00</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Avg speed</div>
+                <div class="metric-value wait" id="stat-avgspeed">pending</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Started</div>
+                <div class="metric-value" id="stat-started">--</div>
+              </div>
             </div>
 
             <div class="hash-block">
               <div class="hash-row">
                 <span class="hash-label">Local SHA-256</span>
                 <div class="hash-value-row">
-                  <span class="hash-value" id="hash-local">—</span>
+                  <span class="hash-value" id="hash-local">--</span>
                   <button class="btn-icon btn-icon-small" id="btn-copy-local-hash" title="Copy local hash" aria-label="Copy local hash">
                     <svg class="icon icon-copy" viewBox="0 0 24 24">
                       <rect x="9" y="9" width="11" height="11" rx="1.5"></rect>
@@ -427,7 +446,7 @@
               <div class="hash-row">
                 <span class="hash-label">Remote SHA-256</span>
                 <div class="hash-value-row">
-                  <span class="hash-value" id="hash-remote">—</span>
+                  <span class="hash-value" id="hash-remote">--</span>
                   <button class="btn-icon btn-icon-small" id="btn-copy-remote-hash" title="Copy remote hash" aria-label="Copy remote hash">
                     <svg class="icon icon-copy" viewBox="0 0 24 24">
                       <rect x="9" y="9" width="11" height="11" rx="1.5"></rect>
@@ -462,7 +481,7 @@
           <div class="ai-chat" id="ai-chat" role="log" aria-live="polite">
             <div class="ai-msg ai-msg-bot">
               <span class="ai-msg-tag">p2p.ai</span>
-              <p class="ai-msg-text">&gt; system ready. ask about sessions, transfers, or connection errors.</p>
+              <p class="ai-msg-text">system ready. ask about sessions, transfers, or connection errors.</p>
             </div>
           </div>
 
@@ -492,7 +511,7 @@
           <ul class="ai-suggest-list" id="ai-suggest-list">
             <li><button type="button" class="ai-suggest" data-q="Does any file data touch the signaling server?">Does file data touch the server?</button></li>
             <li><button type="button" class="ai-suggest" data-q="My peer connection keeps failing to establish, why?">Why does my connection keep failing?</button></li>
-            <li><button type="button" class="ai-suggest" data-q="A transfer froze partway through, what's wrong?">A transfer froze &#8212; what's wrong?</button></li>
+            <li><button type="button" class="ai-suggest" data-q="A transfer froze partway through, what's wrong?">A transfer froze, what's wrong?</button></li>
             <li><button type="button" class="ai-suggest" data-q="How is file integrity verified?">How is file integrity verified?</button></li>
           </ul>
         </aside>
@@ -519,7 +538,7 @@
 
           <section class="card">
             <h2 class="card-title">Connection speed test</h2>
-            <p class="card-lede">Checks ping, download, and upload speed between your browser and this app's server. This is a server throughput test, not the peer-to-peer link itself &mdash; see the note on the right.</p>
+            <p class="card-lede">Checks ping, download, and upload speed between your browser and this app's server. This is a server throughput test, not the peer-to-peer link itself. See the note on the right.</p>
 
             <div class="session-row">
               <button class="btn btn-primary" id="btn-speed-start">Start test</button>
@@ -553,19 +572,19 @@
             <div class="metric-grid speed-result-grid">
               <div class="metric">
                 <div class="metric-label">Ping</div>
-                <div class="metric-value" id="speed-stat-ping">&mdash;</div>
+                <div class="metric-value" id="speed-stat-ping">--</div>
               </div>
               <div class="metric">
                 <div class="metric-label">Jitter</div>
-                <div class="metric-value" id="speed-stat-jitter">&mdash;</div>
+                <div class="metric-value" id="speed-stat-jitter">--</div>
               </div>
               <div class="metric">
                 <div class="metric-label">Download</div>
-                <div class="metric-value" id="speed-stat-download">&mdash;</div>
+                <div class="metric-value" id="speed-stat-download">--</div>
               </div>
               <div class="metric">
                 <div class="metric-label">Upload</div>
-                <div class="metric-value" id="speed-stat-upload">&mdash;</div>
+                <div class="metric-value" id="speed-stat-upload">--</div>
               </div>
             </div>
           </section>
@@ -573,7 +592,7 @@
           <section class="card">
             <h2 class="card-title">What this measures</h2>
             <ul class="docs-list">
-              <li>Ping, jitter, download, and upload are all measured against this app's own server over regular HTTPS &mdash; not your WebRTC link to a peer.</li>
+              <li>Ping, jitter, download, and upload are all measured against this app's own server over regular HTTPS, not your WebRTC link to a peer.</li>
               <li>A file sent in the Transfer tab travels browser-to-browser directly, so it's often faster than this number, especially on the same network.</li>
               <li>Results vary with your ISP, Wi-Fi, VPN, and how busy this server's region is right now.</li>
             </ul>
