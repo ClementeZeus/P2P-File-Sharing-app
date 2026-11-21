@@ -130,12 +130,18 @@
     filename: $('stat-filename'),
     direction: $('stat-direction'),
     filesize: $('stat-filesize'),
+    filetype: $('stat-filetype'),
+    filecount: $('stat-filecount'),
     progressFill: $('progress-fill'),
     pct: $('stat-pct'),
     bytes: $('stat-bytes'),
     speed: $('stat-speed'),
     eta: $('stat-eta'),
     checksum: $('stat-checksum'),
+    transport: $('stat-transport'),
+    duration: $('stat-duration'),
+    avgSpeed: $('stat-avgspeed'),
+    started: $('stat-started'),
     hashLocal: $('hash-local'),
     hashRemote: $('hash-remote'),
     btnCopyLocalHash: $('btn-copy-local-hash'),
@@ -192,6 +198,15 @@
   let peerPresent = false;
   let relayFallbackTimer = null;
   let relayAnnounced = false; // so the "using relay" log line only fires once per session
+
+  // True once this "teardown episode" (one drop of ICE / connection-state /
+  // data-channel, however many of those three events fire for it) has
+  // already logged its single relay-fallback line. Without this, a single
+  // WebRTC drop that's covered by the relay produces three separate log
+  // lines (ice state, connection state, data channel) all saying the same
+  // thing. Reset whenever a fresh link attempt starts so the next drop can
+  // log its own line again.
+  let relayTeardownLogged = false;
 
   // Shareable join links look like #join=ABC234 — opening one should drop
   // the person straight into the "app" tab and auto-join that room as soon
@@ -253,9 +268,25 @@
   // user. Centralizes the "is this actually a problem" judgment so the ICE
   // handler, connection-state handler, and data-channel handler all agree.
   function describeLinkTeardown() {
-    if (justFinishedTransfer()) return 'transfer already completed — idle link teardown, not an error';
-    if (hasRelayFallback()) return 'falling back to the relay link — still connected, nothing to worry about';
+    if (justFinishedTransfer()) return 'transfer already completed, idle link teardown, not an error';
+    if (hasRelayFallback()) return 'relay fallback';
     return null;
+  }
+
+  // True specifically for the "WebRTC dropped but the relay already has us
+  // covered" case, as opposed to the harmless post-transfer idle teardown.
+  // The three handlers below collapse this one case into a single log line
+  // instead of each logging their own raw state.
+  function isRelayCoveredTeardown() {
+    return !justFinishedTransfer() && hasRelayFallback();
+  }
+
+  // Logs the single "now riding the relay" line for the current teardown
+  // episode, once, no matter which of the three handlers notices it first.
+  function logRelayTeardownOnce() {
+    if (relayTeardownLogged) return;
+    relayTeardownLogged = true;
+    logLine('ice state: connected via relay', 'ok');
   }
 
   // =========================================================================
@@ -356,11 +387,44 @@
   }
 
   function formatEta(seconds) {
-    if (!isFinite(seconds) || seconds < 0) return '—';
+    if (!isFinite(seconds) || seconds < 0) return '--';
     if (seconds < 1) return '<1s';
     const m = Math.floor(seconds / 60);
     const s = Math.round(seconds % 60);
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  // mm:ss readout for the Duration metric. Separate from formatEta() above:
+  // that one counts down an estimate, this one counts up an elapsed time,
+  // and they're rounded differently (floor here so it doesn't visually
+  // tick past the final elapsed value by a second at completion).
+  function formatDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '00:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  function formatClockTime(date) {
+    return date.toLocaleTimeString('en-GB', { hour12: false });
+  }
+
+  // Human label for whichever transport is actually moving bytes right
+  // now, for the Transport metric on the Transfer card. Mirrors the same
+  // transportMode() check the send/relay logic itself uses, so the label
+  // never drifts out of sync with reality.
+  function transportLabel() {
+    const mode = transportMode();
+    if (mode === 'webrtc') return 'Direct (P2P)';
+    if (mode === 'relay') return 'Relay';
+    return '--';
+  }
+
+  function transportLabelClass() {
+    const mode = transportMode();
+    if (mode === 'webrtc') return 'ok';
+    if (mode === 'relay') return 'wait';
+    return '';
   }
 
   function bufferToHex(buffer) {
@@ -368,13 +432,13 @@
   }
 
   async function copyToClipboard(text, successMessage) {
-    if (!text || text === '—') return;
+    if (!text || text === '--') return;
     try {
       await navigator.clipboard.writeText(text);
       logLine(successMessage, 'ok');
       return true;
     } catch {
-      logLine('clipboard unavailable — copy the value manually', 'warn');
+      logLine('clipboard unavailable, copy the value manually', 'warn');
       return false;
     }
   }
@@ -389,20 +453,29 @@
   // TRANSFER UI
   // =========================================================================
 
-  function resetTransferUi(name, size, direction) {
+  function resetTransferUi(name, size, direction, mime, fileCount = 1) {
     el.transferCard.classList.add('has-transfer');
     el.filename.textContent = name;
     el.filesize.textContent = formatBytes(size);
+    el.filetype.textContent = mime || 'unknown type';
     el.direction.textContent = direction;
+    el.filecount.textContent = `${fileCount} files`;
+    el.filecount.classList.toggle('hidden', fileCount <= 1);
     el.progressFill.style.transform = 'scaleX(0)';
     el.pct.textContent = '0%';
     el.bytes.textContent = `0 B / ${formatBytes(size)}`;
     el.speed.textContent = '0 KB/s';
-    el.eta.textContent = '—';
+    el.eta.textContent = '--';
     el.checksum.textContent = 'pending';
     el.checksum.className = 'metric-value wait';
-    el.hashLocal.textContent = '—';
-    el.hashRemote.textContent = '—';
+    el.transport.textContent = transportLabel();
+    el.transport.className = 'metric-value ' + transportLabelClass();
+    el.duration.textContent = '00:00';
+    el.avgSpeed.textContent = 'pending';
+    el.avgSpeed.className = 'metric-value wait';
+    el.started.textContent = formatClockTime(new Date());
+    el.hashLocal.textContent = '--';
+    el.hashRemote.textContent = '--';
     setLinkActivity(true);
   }
 
@@ -422,6 +495,23 @@
     el.bytes.textContent = `${formatBytes(done)} / ${formatBytes(total)}`;
     el.speed.textContent = formatSpeed(speed);
     el.eta.textContent = formatEta(etaSec);
+    el.duration.textContent = formatDuration(elapsedSec);
+
+    // The transport can change mid-transfer (a direct link dropping to
+    // relay partway through), so keep this live rather than only setting
+    // it once at the start.
+    el.transport.textContent = transportLabel();
+    el.transport.className = 'metric-value ' + transportLabelClass();
+
+    // done === total marks the finished call every caller makes with
+    // force=true, so this is also where the transfer's final, true
+    // average speed gets its own distinct readout, separate from the
+    // live "Speed" figure above which is only meaningful while a transfer
+    // is actually in progress.
+    if (force && total > 0 && done >= total) {
+      el.avgSpeed.textContent = formatSpeed(speed);
+      el.avgSpeed.className = 'metric-value ok';
+    }
   }
 
   // =========================================================================
@@ -438,7 +528,7 @@
     ws.onopen = () => {
       wsReconnectAttempts = 0;
       setWsStatus('on');
-      logLine(`signal channel open — ${SIGNALING_URL}`, 'ok');
+      logLine(`signal channel open: ${SIGNALING_URL}`, 'ok');
       setBootStatus('Connected');
       finishBoot();
 
@@ -491,9 +581,10 @@
       isHost = false;
       peerPresent = false;
       relayAnnounced = false;
+      relayTeardownLogged = false;
       clearTimeout(relayFallbackTimer);
       el.roomCodeBox.classList.add('hidden');
-      setBootStatus('Signaling unavailable — retrying…');
+      setBootStatus('Signaling unavailable, retrying…');
       finishBoot();
       scheduleReconnect();
     };
@@ -502,7 +593,7 @@
   function scheduleReconnect() {
     wsReconnectAttempts += 1;
     const delay = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_MIN_MS * 2 ** (wsReconnectAttempts - 1));
-    logLine(`signal channel closed — reconnecting in ${Math.round(delay / 1000)}s`, 'warn');
+    logLine(`signal channel closed, reconnecting in ${Math.round(delay / 1000)}s`, 'warn');
     clearTimeout(wsReconnectTimer);
     wsReconnectTimer = setTimeout(connectSignaling, delay);
   }
@@ -511,7 +602,7 @@
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(payload));
     } else {
-      logLine('cannot reach signaling server — check your connection', 'err');
+      logLine('cannot reach signaling server, check your connection', 'err');
     }
   }
 
@@ -526,7 +617,7 @@
         el.btnQrToggle.setAttribute('aria-expanded', 'false');
         renderJoinQr(buildJoinLink(roomId));
         setPeerStatus('waiting');
-        logLine(`room created — code ${roomId}`, 'ok');
+        logLine(`room created: code ${roomId}`, 'ok');
         logLine('waiting for peer to join...', 'info');
         break;
 
@@ -535,7 +626,7 @@
         isHost = false;
         peerPresent = true;
         setPeerStatus('waiting');
-        logLine(`joined room ${roomId} — negotiating link...`, 'ok');
+        logLine(`joined room ${roomId}, negotiating link...`, 'ok');
         // Guest waits passively; host initiates the offer once it sees peer-joined.
         initPeerConnection(false);
         armRelayFallback();
@@ -544,7 +635,7 @@
       case 'peer-joined':
         // Fires on the HOST once the guest joins. Host drives the offer.
         peerPresent = true;
-        logLine('peer joined — opening data channel...', 'ok');
+        logLine('peer joined, opening data channel...', 'ok');
         initPeerConnection(true);
         armRelayFallback();
         break;
@@ -553,6 +644,7 @@
         logLine('peer disconnected', 'warn');
         peerPresent = false;
         relayAnnounced = false;
+        relayTeardownLogged = false;
         clearTimeout(relayFallbackTimer);
         setPeerStatus('lost');
         teardownPeerConnection();
@@ -578,6 +670,7 @@
   function initPeerConnection(isInitiator) {
     if (pc) return; // already negotiating/connected
 
+    relayTeardownLogged = false;
     pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     pc.onicecandidate = (event) => {
@@ -590,12 +683,16 @@
       if (!pc) return;
       const state = pc.iceConnectionState;
       const teardownState = state === 'disconnected' || state === 'failed' || state === 'closed';
-      const benign = teardownState ? describeLinkTeardown() : null;
 
-      logLine(benign ? `ice state: ${state} (${benign})` : `ice state: ${state}`, 'info');
+      if (teardownState && isRelayCoveredTeardown()) {
+        logRelayTeardownOnce();
+      } else {
+        const benign = teardownState ? describeLinkTeardown() : null;
+        logLine(benign ? `ice state: ${state} (${benign})` : `ice state: ${state}`, 'info');
+      }
 
       if (state === 'failed') {
-        reportLinkDown(benign ? null : 'ice handshake failed — peer may be behind a restrictive NAT');
+        reportLinkDown(isRelayCoveredTeardown() ? null : 'ice handshake failed: peer may be behind a restrictive NAT');
       }
       if (state === 'disconnected') {
         reportLinkDown();
@@ -605,11 +702,15 @@
     pc.onconnectionstatechange = () => {
       if (!pc) return;
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        const benign = describeLinkTeardown();
-        if (benign) {
-          logLine(`connection ${pc.connectionState} (${benign})`, 'info');
+        if (isRelayCoveredTeardown()) {
+          logRelayTeardownOnce();
         } else {
-          logLine(`connection ${pc.connectionState}`, 'err');
+          const benign = describeLinkTeardown();
+          if (benign) {
+            logLine(`connection ${pc.connectionState} (${benign})`, 'info');
+          } else {
+            logLine(`connection ${pc.connectionState}`, 'err');
+          }
         }
         teardownPeerConnection();
         reportLinkDown();
@@ -668,17 +769,22 @@
     channel.onopen = () => {
       clearTimeout(relayFallbackTimer);
       relayAnnounced = false;
+      relayTeardownLogged = false;
       setPeerStatus('connected');
-      logLine('data channel open — link established', 'ok');
+      logLine('data channel open, link established', 'ok');
     };
 
     channel.onclose = () => {
       setLinkActivity(false);
-      const benign = describeLinkTeardown();
-      if (benign) {
-        logLine(`data channel closed (${benign})`, 'info');
+      if (isRelayCoveredTeardown()) {
+        logRelayTeardownOnce();
       } else {
-        logLine('data channel closed', 'warn');
+        const benign = describeLinkTeardown();
+        if (benign) {
+          logLine(`data channel closed (${benign})`, 'info');
+        } else {
+          logLine('data channel closed', 'warn');
+        }
       }
       reportLinkDown();
     };
@@ -979,7 +1085,7 @@
     }
 
     if (!transportReady()) {
-      logLine('no active peer link — create or join a room first', 'err');
+      logLine('no active peer link, create or join a room first', 'err');
       return;
     }
 
@@ -996,8 +1102,8 @@
 
     const zipName = `files-${zipTimestampTag()}.zip`;
     const zipFile = new File([zipBlob], zipName, { type: 'application/zip', lastModified: Date.now() });
-    logLine(`archive ready — ${zipName} (${formatBytes(zipFile.size)})`, 'ok');
-    return sendFile(zipFile);
+    logLine(`archive ready: ${zipName} (${formatBytes(zipFile.size)})`, 'ok');
+    return sendFile(zipFile, files.length);
   }
 
   // =========================================================================
@@ -1426,14 +1532,15 @@
   // SECTION 3 — TRANSFER (chunking, backpressure, hashing, download)
   // =========================================================================
 
-  async function sendFile(file) {
+  async function sendFile(file, fileCount = 1) {
     if (!transportReady()) {
-      logLine('no active peer link — create or join a room first', 'err');
+      logLine('no active peer link, create or join a room first', 'err');
       return;
     }
 
+    const mime = file.type || 'application/octet-stream';
     logLine(`reading ${file.name} into memory (${formatBytes(file.size)})...`, 'info');
-    resetTransferUi(file.name, file.size, 'Sending');
+    resetTransferUi(file.name, file.size, 'Sending', mime, fileCount);
 
     let fileBuffer;
     try {
@@ -1448,7 +1555,8 @@
       type: 'meta',
       name: file.name,
       size: file.size,
-      mime: file.type || 'application/octet-stream',
+      mime,
+      count: fileCount,
     });
 
     logLine('hashing (sha-256)...', 'info');
@@ -1472,7 +1580,7 @@
     updateTransferMetrics(file.size, file.size, startTime, true);
     setLinkActivity(false);
     markTransferDone();
-    logLine(`transfer complete — ${file.name} sent`, 'ok');
+    logLine(`transfer complete: ${file.name} sent`, 'ok');
   }
 
   /**
@@ -1563,7 +1671,7 @@
           received: 0,
           startTime: performance.now(),
         };
-        resetTransferUi(msg.name, msg.size, 'Receiving');
+        resetTransferUi(msg.name, msg.size, 'Receiving', msg.mime, msg.count || 1);
         logLine(`incoming: ${msg.name} (${formatBytes(msg.size)})`, 'info');
       } else if (msg.type === 'end') {
         finalizeInbound(msg.hash);
@@ -1584,7 +1692,7 @@
 
     // Binary chunk
     if (!inbound) {
-      logLine('chunk received with no active transfer — ignoring', 'warn');
+      logLine('chunk received with no active transfer, ignoring', 'warn');
       return;
     }
     inbound.chunks.push(event.data);
@@ -1820,6 +1928,23 @@
   let aiHistory = [];   // [{ role: 'user'|'assistant', content }]
   let aiBusy = false;
 
+  // Defense in depth: api/chat.js already strips Markdown-style artifacts
+  // from the model's reply before it ever reaches here, but any text that
+  // ends up in the chat (including the hardcoded fallback lines below)
+  // goes through this too, so a stray code fence, blockquote marker, or
+  // emphasis marker never shows up as literal punctuation in the UI.
+  function stripFormatting(text) {
+    return text
+      .replace(/```[a-zA-Z0-9]*\n?/g, '')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/^>\s?/gm, '')
+      .replace(/^#{1,6}\s*/gm, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/'''/g, '')
+      .trim();
+  }
+
   function appendAiMessage(role, text) {
     const wrap = document.createElement('div');
     wrap.className = `ai-msg ai-msg-${role}`;
@@ -1827,7 +1952,7 @@
       <span class="ai-msg-tag">${role === 'user' ? 'you' : 'p2p.ai'}</span>
       <p class="ai-msg-text"></p>
     `;
-    wrap.querySelector('.ai-msg-text').textContent = text;
+    wrap.querySelector('.ai-msg-text').textContent = role === 'user' ? text : stripFormatting(text);
     el.aiChat.appendChild(wrap);
     el.aiChat.scrollTop = el.aiChat.scrollHeight;
     return wrap;
@@ -1867,7 +1992,7 @@
       aiHistory.push({ role: 'assistant', content: reply });
       aiHistory = aiHistory.slice(-AI_HISTORY_LIMIT);
     } catch (err) {
-      appendAiMessage('err', '> assistant unreachable. check your connection and try again.');
+      appendAiMessage('err', 'assistant unreachable. check your connection and try again.');
     } finally {
       setAiBusy(false);
       el.aiInput.focus();
@@ -1911,7 +2036,7 @@
   }
 
   function formatMbps(mbps) {
-    if (!isFinite(mbps) || mbps < 0) return '—';
+    if (!isFinite(mbps) || mbps < 0) return '--';
     return `${mbps.toFixed(mbps >= 10 ? 1 : 2)} Mbps`;
   }
 
@@ -1935,10 +2060,10 @@
   }
 
   function resetSpeedResults() {
-    el.speedStatPing.textContent = '—';
-    el.speedStatJitter.textContent = '—';
-    el.speedStatDownload.textContent = '—';
-    el.speedStatUpload.textContent = '—';
+    el.speedStatPing.textContent = '--';
+    el.speedStatJitter.textContent = '--';
+    el.speedStatDownload.textContent = '--';
+    el.speedStatUpload.textContent = '--';
     [el.speedStatPing, el.speedStatJitter, el.speedStatDownload, el.speedStatUpload]
       .forEach((n) => { n.className = 'metric-value'; });
   }
@@ -2091,12 +2216,12 @@
 
       if (ping != null) {
         el.speedStatPing.textContent = formatMs(ping);
-        el.speedStatJitter.textContent = jitter != null ? formatMs(jitter) : '—';
+        el.speedStatJitter.textContent = jitter != null ? formatMs(jitter) : '--';
         logLine(`ping ${formatMs(ping)}${jitter != null ? `, jitter ${formatMs(jitter)}` : ''}`, 'ok', el.speedLog);
       } else {
         el.speedStatPing.textContent = 'failed';
         el.speedStatPing.className = 'metric-value err';
-        logLine('ping test failed — server unreachable', 'err', el.speedLog);
+        logLine('ping test failed: server unreachable', 'err', el.speedLog);
       }
 
       // --- download ----------------------------------------------------
@@ -2108,7 +2233,7 @@
           const mbps = sec > 0 ? (bytes * 8) / sec / 1e6 : 0;
           el.speedStatDownload.textContent = formatMbps(mbps);
           const frac = Math.min(1, (sec * 1000) / SPEED_DOWNLOAD_MS);
-          setSpeedProgress(20 + frac * 35, `Testing download — ${formatMbps(mbps)}`);
+          setSpeedProgress(20 + frac * 35, `Testing download: ${formatMbps(mbps)}`);
         },
       );
       if (speedState.cancelled) throw new Error('cancelled');
@@ -2126,7 +2251,7 @@
           const mbps = sec > 0 ? (bytes * 8) / sec / 1e6 : 0;
           el.speedStatUpload.textContent = formatMbps(mbps);
           const frac = Math.min(1, (sec * 1000) / SPEED_UPLOAD_MS);
-          setSpeedProgress(55 + frac * 40, `Testing upload — ${formatMbps(mbps)}`);
+          setSpeedProgress(55 + frac * 40, `Testing upload: ${formatMbps(mbps)}`);
         },
       );
       if (speedState.cancelled) throw new Error('cancelled');
